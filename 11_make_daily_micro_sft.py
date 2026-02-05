@@ -137,8 +137,8 @@ def main() -> None:
     ap.add_argument(
         "--include_modes",
         default=(
-            "url,entity,latest,latest_ddg_fallback,web_general,web_general_news_fallback,web_no_results,"
-            "confidence_entity_fallback,confidence_latest_fallback,confidence_web_general_fallback,"
+            "url,entity,latest,latest_ddg_fallback,web_general,web_general_retry,web_spacex,web_compare_wikipedia,web_wikipedia_search,web_inflation_official,web_stock_official,web_general_news_fallback,web_no_results,"
+            "confidence_entity_fallback,confidence_latest_fallback,confidence_web_general_fallback,confidence_web_general_retry,confidence_web_spacex,confidence_web_compare_wikipedia,confidence_web_wikipedia_search,confidence_web_inflation_official,confidence_web_stock_official,"
             "confidence_web_no_results,"
             "summary_fallback,math_fallback"
         ),

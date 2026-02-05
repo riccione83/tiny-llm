@@ -136,6 +136,14 @@ Dataset only (no training):
 powershell -ExecutionPolicy Bypass -File 12_daily_micro_retrain.ps1 -NoTrain
 ```
 
+## Quick Quality Check
+
+Run a fixed regression suite (constraints + summarize + web queries):
+
+```powershell
+python 13_eval_chat_quality.py --base_ckpt checkpoints_v2/final.pt --tokenizer tokenizer.model --lora_adapter finetuning_v2/lora_adapter.pt
+```
+
 ## Notes / Known Risks
 
 - From-scratch pretraining quality is token-budget dependent.

@@ -42,6 +42,7 @@ DROPOUT = 0.0
 MAX_NEW_TOKENS = 180
 DEFAULT_TEMPERATURE = 0.0   # deterministic by default
 DEFAULT_TOP_P = 1.0         # deterministic with top-1 path below
+WEB_FETCH_TIMEOUT = 10
 
 URL_RE = re.compile(r"https?://[^\s)>\]]+", re.IGNORECASE)
 BAD_SENTENCE_HINTS = [
@@ -96,6 +97,12 @@ TRUSTED_DOMAIN_HINTS = [
     "nature.com",
     "science.org",
     "who.int",
+    "tomshardware.com",
+    "anandtech.com",
+    "techpowerup.com",
+    "space.com",
+    "ons.gov.uk",
+    "bls.gov",
 ]
 
 LOW_QUALITY_DOMAIN_HINTS = [
@@ -107,6 +114,8 @@ LOW_QUALITY_DOMAIN_HINTS = [
     "instagram.com",
     "tiktok.com",
 ]
+
+_PAGE_TEXT_CACHE: Dict[str, str] = {}
 
 
 def normalize(text: str) -> str:
@@ -187,6 +196,30 @@ def _fetch_raw_html(url: str, timeout: int = 15) -> Optional[str]:
             return r.read().decode("utf-8", errors="ignore")
     except Exception:
         return None
+
+
+def _post_json(url: str, payload: Dict[str, object], timeout: int = 15) -> Optional[Dict[str, object]]:
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=data,
+        method="POST",
+        headers={
+            "User-Agent": "Mozilla/5.0 (compatible; tiny-llm-bot/1.0)",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            text = r.read().decode("utf-8", errors="ignore")
+    except Exception:
+        return None
+    try:
+        obj = json.loads(text)
+    except Exception:
+        return None
+    return obj if isinstance(obj, dict) else None
 
 
 def _jina_proxy_url(url: str) -> str:
@@ -381,6 +414,11 @@ def _prefer_general_web(user: str) -> bool:
     return intent in {"specs", "compare", "launches", "travel", "regulation", "economy"}
 
 
+def _allow_news_fallback(intent: str) -> bool:
+    # Prefer focused pages first, but never leave the user with no answer.
+    return True
+
+
 def _entity_from_query(user: str) -> Optional[str]:
     low = normalize(user).lower().strip()
     pats = [
@@ -463,6 +501,94 @@ def _try_entity_answer(user: str, timeout: int = 15) -> Optional[Tuple[str, List
     if src:
         ans = f"{ans}\n\nSource:\n- {src[0]}"
     return ans, src
+
+
+def _extract_compare_entities(user: str) -> Optional[Tuple[str, str]]:
+    q = normalize(user).strip(" ?.")
+    low = q.lower()
+    patterns = [
+        r"compare\s+(.+?)\s+(?:vs|versus)\s+(.+)$",
+        r"difference between\s+(.+?)\s+and\s+(.+)$",
+        r"how do\s+(.+?)\s+and\s+(.+?)\s+differ$",
+    ]
+    for pat in patterns:
+        m = re.search(pat, low, flags=re.IGNORECASE)
+        if not m:
+            continue
+        a = normalize(m.group(1)).strip(" ,.")
+        b = normalize(m.group(2)).strip(" ,.")
+        if a and b and a != b:
+            return a, b
+    return None
+
+
+def _fuzzy_wiki_entity_candidates(entity: str) -> List[str]:
+    e = normalize(entity).strip(" ,.")
+    low = e.lower()
+    out = [e]
+    cleaned = low
+    cleaned = re.sub(r"^nvidia\s+", "", cleaned)
+    cleaned = re.sub(r"\b(architectures?|architecture|gpus?|cpus?)\b", "", cleaned).strip()
+    if cleaned and cleaned != low:
+        out.append(cleaned)
+
+    if "blackwell" in low:
+        out += ["Blackwell (microarchitecture)", "Blackwell architecture"]
+    if "ada lovelace" in low or ("ada" in low and "lovelace" in low):
+        out += ["Ada Lovelace (microarchitecture)", "Ada Lovelace architecture"]
+
+    uniq: List[str] = []
+    seen = set()
+    for x in out:
+        k = x.lower().strip()
+        if not k or k in seen:
+            continue
+        seen.add(k)
+        uniq.append(x.strip())
+    return uniq
+
+
+def _wikipedia_summary_fuzzy(entity: str, timeout: int = 12) -> Optional[Dict[str, str]]:
+    cands = _fuzzy_wiki_entity_candidates(entity)
+    for i, cand in enumerate(cands):
+        w = _wikipedia_summary(cand, timeout=timeout)
+        if w is None:
+            continue
+        extract_low = normalize(w.get("extract", "")).lower()
+        # Skip disambiguation-like pages when better candidates exist.
+        if "may refer to" in extract_low and i < (len(cands) - 1):
+            continue
+        return w
+    return None
+
+
+def _try_compare_wikipedia(user: str, timeout: int = 12) -> Optional[Tuple[str, List[str]]]:
+    pair = _extract_compare_entities(user)
+    if not pair:
+        return None
+    a, b = pair
+    wa = _wikipedia_summary_fuzzy(a, timeout=timeout)
+    wb = _wikipedia_summary_fuzzy(b, timeout=timeout)
+    if not wa or not wb:
+        return None
+
+    sa = _split_sentences(wa.get("extract", ""))
+    sb = _split_sentences(wb.get("extract", ""))
+    pa = sa[0] if sa else wa.get("extract", "")
+    pb = sb[0] if sb else wb.get("extract", "")
+    ans = (
+        "Comparison overview from reference sources:\n"
+        f"- {wa.get('title', a)}: {pa}\n"
+        f"- {wb.get('title', b)}: {pb}"
+    )
+    src: List[str] = []
+    if wa.get("url"):
+        src.append(wa["url"])
+    if wb.get("url"):
+        src.append(wb["url"])
+    if src:
+        ans += "\n\nSources:\n" + "\n".join(f"- {u}" for u in src[:3])
+    return ans, src[:3]
 
 
 def _clean_news_title(title: str) -> str:
@@ -548,6 +674,34 @@ def _search_duckduckgo(query: str, max_items: int = 8, timeout: int = 15) -> Lis
     return out
 
 
+def _strip_tags(text: str) -> str:
+    return normalize(html.unescape(re.sub(r"<.*?>", " ", text or "")))
+
+
+def _search_bing_web(query: str, max_items: int = 8, timeout: int = 15) -> List[Dict[str, str]]:
+    q = urllib.parse.quote_plus(normalize(query))
+    url = f"https://www.bing.com/search?q={q}&setlang=en-US"
+    raw = _fetch_raw_html(url, timeout=timeout)
+    if not raw:
+        return []
+    out: List[Dict[str, str]] = []
+    for m in re.finditer(r'<li class=\"b_algo\".*?</li>', raw, re.IGNORECASE | re.DOTALL):
+        block = m.group(0)
+        a = re.search(r'<h2>\s*<a href=\"([^\"]+)\"[^>]*>(.*?)</a>', block, re.IGNORECASE | re.DOTALL)
+        if not a:
+            continue
+        link = normalize(a.group(1))
+        title = _strip_tags(a.group(2))
+        p = re.search(r"<p>(.*?)</p>", block, re.IGNORECASE | re.DOTALL)
+        snip = _strip_tags(p.group(1)) if p else ""
+        if not title or not link:
+            continue
+        out.append({"title": title, "link": link, "snippet": snip, "pub_date": ""})
+        if len(out) >= max_items:
+            break
+    return out
+
+
 def _web_hit_score(query: str, item: Dict[str, str]) -> int:
     text = normalize(f"{item.get('title', '')} {item.get('snippet', '')}").lower()
     q_toks = _query_tokens(query)
@@ -593,7 +747,488 @@ def _search_general_web(query: str, max_items: int = 5, timeout: int = 15) -> Li
     all_items: List[Dict[str, str]] = []
     for variant in _ddg_query_variants(query):
         all_items.extend(_search_duckduckgo(variant, max_items=max(6, max_items * 2), timeout=timeout))
+    # DDG can be unstable; blend with Bing for better hit coverage.
+    if len(all_items) < max_items:
+        for variant in _ddg_query_variants(query):
+            all_items.extend(_search_bing_web(variant, max_items=max(6, max_items * 2), timeout=timeout))
     return _rank_web_hits(query, all_items, max_items=max_items)
+
+
+def _search_wikipedia_pages(query: str, max_items: int = 5, timeout: int = 12) -> List[Dict[str, str]]:
+    url = (
+        "https://en.wikipedia.org/w/api.php?action=opensearch"
+        f"&search={urllib.parse.quote_plus(normalize(query))}&limit={max(1, int(max_items))}&namespace=0&format=json"
+    )
+    txt = _fetch_text(url, timeout=timeout)
+    if not txt:
+        return []
+    try:
+        data = json.loads(txt)
+        titles = data[1] if isinstance(data, list) and len(data) > 1 else []
+        descs = data[2] if isinstance(data, list) and len(data) > 2 else []
+        links = data[3] if isinstance(data, list) and len(data) > 3 else []
+    except Exception:
+        return []
+
+    out: List[Dict[str, str]] = []
+    n = min(len(titles), len(links), max(1, int(max_items)))
+    for i in range(n):
+        title = normalize(str(titles[i]))
+        link = normalize(str(links[i]))
+        desc = normalize(str(descs[i] if i < len(descs) else ""))
+        if not title or not link:
+            continue
+        if not desc:
+            ws = _wikipedia_summary(title, timeout=timeout)
+            if ws:
+                desc = _split_sentences(ws.get("extract", ""))[0] if _split_sentences(ws.get("extract", "")) else ws.get("extract", "")
+        out.append({"title": title, "link": link, "snippet": normalize(desc), "pub_date": ""})
+    return out
+
+
+def _get_page_text_cached(url: str, timeout: int = WEB_FETCH_TIMEOUT) -> Optional[str]:
+    key = normalize(url)
+    if not key:
+        return None
+    if key in _PAGE_TEXT_CACHE:
+        return _PAGE_TEXT_CACHE[key]
+    txt = _fetch_article_text(key, timeout=timeout)
+    if txt:
+        txt = _clean_web_noise(txt)
+    if txt and len(txt) >= 80:
+        _PAGE_TEXT_CACHE[key] = txt
+        return txt
+    return None
+
+
+def _score_sentence_for_query(sentence: str, query_tokens: List[str], intent: str) -> int:
+    low = sentence.lower()
+    overlap = sum(1 for t in query_tokens if t in low)
+    score = overlap * 3
+    if intent == "specs":
+        score += 2 * _numeric_signal_count(sentence)
+        if any(k in low for k in ("cuda", "memory", "gb", "ghz", "watt", "tdp", "bandwidth")):
+            score += 3
+    if intent == "compare" and any(k in low for k in ("vs", "versus", "compared", "difference", "higher", "lower")):
+        score += 3
+    if intent == "launches" and any(k in low for k in ("launch", "mission", "success", "failed", "landed")):
+        score += 3
+    return score
+
+
+def _collect_evidence_sentences(query: str, items: List[Dict[str, str]], max_items: int = 2) -> List[Dict[str, str]]:
+    intent = _query_intent(query)
+    q_tokens = _query_tokens(query)
+    out: List[Dict[str, str]] = []
+    for it in items[: max(1, max_items)]:
+        url = normalize(it.get("link", ""))
+        if not url:
+            continue
+        page = _get_page_text_cached(url)
+        if not page:
+            continue
+        sents = _split_sentences(page)
+        if not sents:
+            continue
+        ranked = sorted(
+            (( _score_sentence_for_query(s, q_tokens, intent), s) for s in sents if len(s.split()) >= 6),
+            key=lambda x: x[0],
+            reverse=True,
+        )
+        best = [s for sc, s in ranked[:2] if sc > 0]
+        if not best:
+            continue
+        out.append({"title": normalize(it.get("title", "")), "link": url, "evidence": " ".join(best)})
+    return out
+
+
+def _has_uk_us_inflation_intent(query: str) -> bool:
+    low = normalize(query).lower()
+    if "inflation" not in low and "cpi" not in low:
+        return False
+    has_uk = (" uk " in f" {low} ") or ("united kingdom" in low) or ("britain" in low)
+    has_us = (re.search(r"\bus\b", low) is not None) or ("united states" in low) or ("america" in low)
+    return has_uk and has_us
+
+
+def _has_stock_intent(query: str) -> bool:
+    low = normalize(query).lower()
+    return ("stock" in low) or ("shares" in low) or ("ticker" in low) or ("nvda" in low)
+
+
+def _extract_stock_symbols(query: str) -> List[str]:
+    low = normalize(query).lower()
+    mapped: List[str] = []
+    name_map = {
+        "nvidia": "NVDA",
+        "amd": "AMD",
+        "intel": "INTC",
+        "microsoft": "MSFT",
+        "apple": "AAPL",
+        "amazon": "AMZN",
+        "google": "GOOGL",
+        "alphabet": "GOOGL",
+        "meta": "META",
+        "tesla": "TSLA",
+    }
+    for k, v in name_map.items():
+        if k in low:
+            mapped.append(v)
+
+    for t in re.findall(r"\b[A-Z]{1,5}\b", query):
+        if t.isalpha():
+            mapped.append(t.upper())
+
+    if "nvda" in low:
+        mapped.append("NVDA")
+
+    uniq: List[str] = []
+    seen = set()
+    for s in mapped:
+        if s in seen:
+            continue
+        seen.add(s)
+        uniq.append(s)
+    return uniq[:3]
+
+
+def _fetch_stooq_daily(symbol: str, timeout: int = 12) -> Optional[Dict[str, float | str]]:
+    sym = normalize(symbol).upper()
+    if not sym:
+        return None
+    url = f"https://stooq.com/q/d/l/?s={sym.lower()}.us&i=d"
+    txt = _fetch_text(url, timeout=timeout)
+    if not txt:
+        return None
+    lines = [x.strip() for x in txt.splitlines() if x.strip()]
+    if len(lines) < 3:
+        return None
+    # CSV: Date,Open,High,Low,Close,Volume
+    def parse_row(r: str) -> Optional[Tuple[str, float]]:
+        p = r.split(",")
+        if len(p) < 5:
+            return None
+        d = p[0].strip()
+        try:
+            c = float(p[4])
+        except Exception:
+            return None
+        return d, c
+
+    last = parse_row(lines[-1])
+    prev = parse_row(lines[-2])
+    if not last or not prev:
+        return None
+    d_last, c_last = last
+    _, c_prev = prev
+    if abs(c_prev) < 1e-12:
+        return None
+    pct = (c_last / c_prev - 1.0) * 100.0
+    return {"symbol": sym, "date": d_last, "close": c_last, "change_pct": pct}
+
+
+def _fetch_fred_series_rows(series_id: str, timeout: int = 12) -> List[Tuple[str, float]]:
+    url = f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={urllib.parse.quote_plus(series_id)}"
+    txt = _fetch_text(url, timeout=timeout)
+    if not txt:
+        return []
+    rows: List[Tuple[str, float]] = []
+    for line in txt.splitlines()[1:]:
+        parts = line.split(",", 1)
+        if len(parts) != 2:
+            continue
+        d, v = parts[0].strip(), parts[1].strip()
+        if not d or not v or v == ".":
+            continue
+        try:
+            fv = float(v)
+        except Exception:
+            continue
+        rows.append((d, fv))
+    return rows
+
+
+def _fred_latest_and_yoy(series_id: str, timeout: int = 12) -> Optional[Dict[str, float | str]]:
+    rows = _fetch_fred_series_rows(series_id, timeout=timeout)
+    if len(rows) < 13:
+        return None
+    d_last, v_last = rows[-1]
+    _, v_prev = rows[-13]
+    if abs(v_prev) < 1e-12:
+        return None
+    yoy = (v_last / v_prev - 1.0) * 100.0
+    return {"date": d_last, "value": v_last, "yoy": yoy}
+
+
+def _best_percent_sentence(text: str, country_terms: List[str]) -> str:
+    sents = _split_sentences(text)
+    best = ""
+    best_score = -1
+    for s in sents:
+        low = s.lower()
+        if "%" not in s and not re.search(r"\b\d+(?:\.\d+)?\b", s):
+            continue
+        score = 0
+        score += 2 * sum(1 for t in country_terms if t in low)
+        if "inflation" in low or "cpi" in low:
+            score += 3
+        score += _numeric_signal_count(s)
+        if score > best_score:
+            best = s
+            best_score = score
+    return normalize(best)
+
+
+def _pick_primary_source(items: List[Dict[str, str]], prefer_domains: List[str]) -> Optional[Dict[str, str]]:
+    if not items:
+        return None
+    for it in items:
+        d = _domain_from_url(it.get("link", ""))
+        if any(h in d for h in prefer_domains):
+            return it
+    return items[0]
+
+
+def _try_uk_us_inflation_answer(query: str, max_items: int = 5, timeout: int = 15) -> Optional[Tuple[str, List[str], str]]:
+    if not _has_uk_us_inflation_intent(query):
+        return None
+
+    # Prefer deterministic numeric source (FRED CSV mirrors) for a stable answer format.
+    uk = _fred_latest_and_yoy("GBRCPIALLMINMEI", timeout=min(timeout, 12))
+    us = _fred_latest_and_yoy("CPIAUCSL", timeout=min(timeout, 12))
+    if uk and us:
+        uk_date = str(uk["date"])
+        us_date = str(us["date"])
+        uk_val = float(uk["value"])
+        us_val = float(us["value"])
+        uk_yoy = float(uk["yoy"])
+        us_yoy = float(us["yoy"])
+        ans = (
+            "Current inflation snapshot (UK vs US, latest available data):\n"
+            f"- UK ({uk_date}): CPI index {uk_val:.2f}, approx YoY {uk_yoy:.2f}%.\n"
+            f"- US ({us_date}): CPI index {us_val:.2f}, approx YoY {us_yoy:.2f}%."
+        )
+        src = [
+            "https://fred.stlouisfed.org/series/GBRCPIALLMINMEI",
+            "https://fred.stlouisfed.org/series/CPIAUCSL",
+        ]
+        ans += "\n\nSources:\n" + "\n".join(f"- {u}" for u in src)
+        return ans, src, "web_inflation_official"
+
+    uk_hits = _search_general_web("UK inflation rate latest ONS CPI", max_items=max_items, timeout=timeout)
+    us_hits = _search_general_web("US inflation rate latest BLS CPI", max_items=max_items, timeout=timeout)
+    uk_src = _pick_primary_source(uk_hits, ["ons.gov.uk", "ft.com", "bbc.com"])
+    us_src = _pick_primary_source(us_hits, ["bls.gov", "reuters.com", "ft.com"])
+    if not uk_src or not us_src:
+        return None
+
+    uk_text = _get_page_text_cached(uk_src.get("link", ""), timeout=min(timeout, WEB_FETCH_TIMEOUT))
+    us_text = _get_page_text_cached(us_src.get("link", ""), timeout=min(timeout, WEB_FETCH_TIMEOUT))
+
+    uk_line = _best_percent_sentence(uk_text or (uk_src.get("snippet", "") or ""), ["uk", "united kingdom", "britain"])
+    us_line = _best_percent_sentence(us_text or (us_src.get("snippet", "") or ""), ["us", "united states", "america"])
+
+    if not uk_line:
+        uk_line = _clean_snippet(uk_src.get("snippet", "") or uk_src.get("title", ""), max_chars=220)
+    if not us_line:
+        us_line = _clean_snippet(us_src.get("snippet", "") or us_src.get("title", ""), max_chars=220)
+
+    # Require at least one numeric signal for each side; otherwise it's too vague.
+    if _numeric_signal_count(uk_line) < 1 or _numeric_signal_count(us_line) < 1:
+        return None
+
+    ans = (
+        "Current inflation snapshot (UK vs US):\n"
+        f"- UK: {uk_line}\n"
+        f"- US: {us_line}"
+    )
+    src = [uk_src.get("link", ""), us_src.get("link", "")]
+    src = [u for u in src if normalize(u)]
+    if src:
+        ans += "\n\nSources:\n" + "\n".join(f"- {u}" for u in src[:3])
+    return ans, src[:3], "web_inflation_official"
+
+
+def _try_stock_answer(query: str, max_items: int = 5, timeout: int = 15) -> Optional[Tuple[str, List[str], str]]:
+    if not _has_stock_intent(query):
+        return None
+    symbols = _extract_stock_symbols(query)
+    if not symbols:
+        return None
+
+    rows: List[Dict[str, float | str]] = []
+    for s in symbols[:3]:
+        r = _fetch_stooq_daily(s, timeout=min(timeout, 12))
+        if r is not None:
+            rows.append(r)
+    if not rows:
+        return None
+
+    lines: List[str] = []
+    for r in rows:
+        sym = str(r["symbol"])
+        d = str(r["date"])
+        c = float(r["close"])
+        p = float(r["change_pct"])
+        sign = "+" if p >= 0 else ""
+        lines.append(f"- {sym} ({d}): close {c:.2f}, 1-day change {sign}{p:.2f}%")
+
+    src = ["https://stooq.com/"]
+
+    # add one short current-news layer for the first symbol
+    news_q = f"{rows[0]['symbol']} stock latest news"
+    news_items = _search_google_news(news_q, max_items=max(1, min(2, max_items)), timeout=timeout)
+    if news_items:
+        lines.append(f"- News: {_clean_news_title(news_items[0].get('title', ''))}.")
+        for it in news_items[:2]:
+            u = normalize(it.get("source_url", "")) or normalize(it.get("link", ""))
+            if u:
+                src.append(u)
+
+    ans = "Latest stock snapshot:\n" + "\n".join(lines)
+    src = [u for i, u in enumerate(src) if u and u not in src[:i]]
+    ans += "\n\nSources:\n" + "\n".join(f"- {u}" for u in src[:3])
+    return ans, src[:3], "web_stock_official"
+
+
+def _search_spacex_recent_launches_ll2(max_items: int = 5, timeout: int = 15) -> List[Dict[str, str]]:
+    # Launch Library 2 is usually fresher than some mirrors and includes outcome status.
+    now = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    q = urllib.parse.urlencode(
+        {
+            "search": "SpaceX",
+            "net__lte": now,
+            "ordering": "-net",
+            "limit": str(max(1, int(max_items))),
+        }
+    )
+    url = f"https://ll.thespacedevs.com/2.2.0/launch/?{q}"
+    txt = _fetch_text(url, timeout=timeout)
+    if not txt:
+        return []
+    try:
+        data = json.loads(txt)
+        results = data.get("results", []) if isinstance(data, dict) else []
+    except Exception:
+        return []
+    if not isinstance(results, list):
+        return []
+
+    out: List[Dict[str, str]] = []
+    for r in results:
+        if not isinstance(r, dict):
+            continue
+        name = normalize(str(r.get("name", "")))
+        if not name:
+            continue
+        net = normalize(str(r.get("net", "")))
+        status = r.get("status", {}) if isinstance(r.get("status", {}), dict) else {}
+        outcome = normalize(str(status.get("abbrev", ""))).lower()
+        if not outcome:
+            outcome = normalize(str(status.get("name", "unknown"))).lower()
+        mission = r.get("mission", {}) if isinstance(r.get("mission", {}), dict) else {}
+        detail = normalize(str(mission.get("description", "")))
+        src = normalize(str(r.get("url", ""))) or "https://thespacedevs.com/launches/"
+        out.append(
+            {
+                "title": name,
+                "link": src,
+                "pub_date": net,
+                "snippet": detail,
+                "outcome": outcome,
+            }
+        )
+    return out
+
+
+def _search_spacex_recent_launches(max_items: int = 5, timeout: int = 15) -> List[Dict[str, str]]:
+    payload: Dict[str, object] = {
+        "query": {"upcoming": False},
+        "options": {
+            "sort": {"date_unix": "desc"},
+            "limit": int(max(1, max_items)),
+            "select": ["name", "date_utc", "date_unix", "success", "details", "links"],
+        },
+    }
+    res = _post_json("https://api.spacexdata.com/v5/launches/query", payload, timeout=timeout)
+    docs = res.get("docs", []) if isinstance(res, dict) else []
+    if not isinstance(docs, list):
+        return []
+
+    out: List[Dict[str, str]] = []
+    for d in docs:
+        if not isinstance(d, dict):
+            continue
+        name = normalize(str(d.get("name", "")))
+        date_utc = normalize(str(d.get("date_utc", "")))
+        if not date_utc and d.get("date_unix") is not None:
+            try:
+                date_utc = datetime.fromtimestamp(float(d.get("date_unix")), tz=timezone.utc).isoformat()
+            except Exception:
+                date_utc = ""
+        success_raw = d.get("success", None)
+        if success_raw is True:
+            outcome = "success"
+        elif success_raw is False:
+            outcome = "failed"
+        else:
+            outcome = "unknown"
+        details_obj = d.get("details", "")
+        details = normalize(details_obj) if isinstance(details_obj, str) else ""
+        links = d.get("links", {}) if isinstance(d.get("links", {}), dict) else {}
+        src = ""
+        if isinstance(links.get("wikipedia"), str):
+            src = normalize(str(links.get("wikipedia", "")))
+        if not src and isinstance(links.get("webcast"), str):
+            src = normalize(str(links.get("webcast", "")))
+        if not src:
+            src = "https://www.spacex.com/launches/"
+        if not name:
+            continue
+        out.append(
+            {
+                "title": name,
+                "link": src,
+                "pub_date": date_utc,
+                "snippet": details,
+                "outcome": outcome,
+            }
+        )
+    # Guard against stale mirror/API data; fallback to broader web search if outdated.
+    if out:
+        try:
+            newest = out[0].get("pub_date", "")
+            newest_dt = datetime.fromisoformat(str(newest).replace("Z", "+00:00"))
+            age_days = (datetime.now(timezone.utc) - newest_dt).days
+            if age_days > 400:
+                return _search_spacex_recent_launches_ll2(max_items=max_items, timeout=timeout)
+        except Exception:
+            pass
+    if out:
+        return out
+    return _search_spacex_recent_launches_ll2(max_items=max_items, timeout=timeout)
+
+
+def _format_spacex_launches_answer(items: List[Dict[str, str]]) -> str:
+    if not items:
+        return _web_no_result_answer("spacex recent launches")
+    lines: List[str] = []
+    for it in items[:3]:
+        dt = normalize(it.get("pub_date", ""))
+        try:
+            d = datetime.fromisoformat(dt.replace("Z", "+00:00")).date().isoformat() if dt else "unknown-date"
+        except Exception:
+            d = dt[:10] if len(dt) >= 10 else "unknown-date"
+        name = normalize(it.get("title", ""))
+        outcome = normalize(it.get("outcome", "unknown")) or "unknown"
+        detail = normalize(it.get("snippet", ""))
+        if detail:
+            detail = _two_sentence_text(detail)
+            lines.append(f"- {d} | {name} | outcome: {outcome} | note: {detail}")
+        else:
+            lines.append(f"- {d} | {name} | outcome: {outcome}")
+    src = "\n".join(f"- {it['link']}" for it in items[:3] if it.get("link"))
+    return "Most recent SpaceX launches and outcomes:\n" + "\n".join(lines) + f"\n\nSources:\n{src}"
 
 
 def _latest_news_quality(query: str, items: List[Dict[str, str]]) -> int:
@@ -602,30 +1237,96 @@ def _latest_news_quality(query: str, items: List[Dict[str, str]]) -> int:
     return max(_latest_title_score(it.get("title", ""), query) for it in items[:3])
 
 
+def _clean_snippet(snippet: str, max_chars: int = 220) -> str:
+    s = normalize(snippet)
+    s = re.sub(r"\s+", " ", s).strip()
+    if len(s) > max_chars:
+        s = s[: max_chars - 1].rstrip() + "…"
+    return s
+
+
+def _numeric_signal_count(text: str) -> int:
+    return len(re.findall(r"\b\d+(?:\.\d+)?\b", text))
+
+
+def _intent_answer_quality_ok(query: str, answer: str) -> bool:
+    intent = _query_intent(query)
+    low = normalize(answer).lower()
+    if not low:
+        return False
+    if intent == "specs":
+        return _numeric_signal_count(low) >= 2
+    if intent == "launches":
+        return ("outcome:" in low) or ("success" in low) or ("failed" in low)
+    if intent == "compare":
+        return ("compare" in low) or ("difference" in low) or ("another source" in low)
+    return True
+
+
 def _format_general_web_answer(query: str, items: List[Dict[str, str]]) -> str:
     if not items:
         return "I couldn't find reliable web results for that query right now."
     intent = _query_intent(query)
     lead = items[0]
     second = items[1] if len(items) > 1 else lead
-    s1 = lead.get("snippet", "") or lead.get("title", "")
-    s2 = second.get("snippet", "") or second.get("title", "")
-    s1 = _two_sentence_text(s1)
-    s2 = _two_sentence_text(s2)
-    if intent == "specs":
-        resp = f"Key specs/features from current sources: {s1} Another source adds: {s2}"
-    elif intent == "compare":
-        resp = f"Comparison highlights from web sources: {s1} Another source notes: {s2}"
-    elif intent == "launches":
-        resp = f"Recent launch/outcome sources report: {s1} Another source reports: {s2}"
-    elif intent == "travel":
-        resp = f"Current travel guidance says: {s1} Another source suggests: {s2}"
-    elif intent == "regulation":
-        resp = f"Recent regulatory sources indicate: {s1} Another source states: {s2}"
-    elif intent == "economy":
-        resp = f"Recent market/economic sources indicate: {s1} Another source reports: {s2}"
+    t1 = normalize(lead.get("title", ""))
+    t2 = normalize(second.get("title", ""))
+
+    evidence = _collect_evidence_sentences(query, items, max_items=2)
+    if evidence:
+        e1 = _clean_snippet(evidence[0].get("evidence", ""), max_chars=320)
+        e2 = _clean_snippet((evidence[1].get("evidence", "") if len(evidence) > 1 else e1), max_chars=320)
+        s1, s2 = e1, e2
+        if evidence[0].get("title"):
+            t1 = evidence[0]["title"]
+        if len(evidence) > 1 and evidence[1].get("title"):
+            t2 = evidence[1]["title"]
     else:
-        resp = f"Web results indicate: {s1} Another source reports: {s2}"
+        s1 = _clean_snippet(lead.get("snippet", "") or lead.get("title", ""))
+        s2 = _clean_snippet(second.get("snippet", "") or second.get("title", ""))
+
+    if intent == "specs":
+        resp = (
+            f"Current specs/features summary:\n"
+            f"- {t1}: {s1}\n"
+            f"- {t2}: {s2}"
+        )
+    elif intent == "compare":
+        resp = (
+            f"Comparison summary from current sources:\n"
+            f"- Source 1 ({t1}): {s1}\n"
+            f"- Source 2 ({t2}): {s2}"
+        )
+    elif intent == "launches":
+        resp = (
+            f"Recent launch/outcome information from web sources:\n"
+            f"- {t1}: {s1}\n"
+            f"- {t2}: {s2}"
+        )
+    elif intent == "travel":
+        resp = (
+            f"Current travel guidance:\n"
+            f"- {t1}: {s1}\n"
+            f"- {t2}: {s2}"
+        )
+    elif intent == "regulation":
+        resp = (
+            f"Recent regulatory update summary:\n"
+            f"- {t1}: {s1}\n"
+            f"- {t2}: {s2}"
+        )
+    elif intent == "economy":
+        resp = (
+            f"Recent market/economy summary:\n"
+            f"- {t1}: {s1}\n"
+            f"- {t2}: {s2}"
+        )
+    else:
+        resp = (
+            f"Web summary:\n"
+            f"- {t1}: {s1}\n"
+            f"- {t2}: {s2}"
+        )
     src = "\n".join(f"- {it['link']}" for it in items[:3] if it.get("link"))
     return f"{resp}\n\nSources:\n{src}"
 
@@ -635,6 +1336,78 @@ def _web_no_result_answer(query: str) -> str:
         "I couldn't find reliable web results for that query right now. "
         "Please try a more specific version (topic + year/source)."
     )
+
+
+def _intent_retry_query(query: str) -> str:
+    intent = _query_intent(query)
+    suffix = {
+        "specs": "detailed technical specifications",
+        "compare": "technical comparison key differences",
+        "launches": "recent missions outcomes status",
+        "travel": "current official travel guide",
+        "regulation": "official update legal text",
+        "economy": "latest official data report",
+    }.get(intent, "reliable sources")
+    return f"{normalize(query)} {suffix}".strip()
+
+
+def _try_general_web_answer(query: str, max_items: int = 5, timeout: int = 15) -> Optional[Tuple[str, List[str], str]]:
+    q = normalize(query)
+    intent = _query_intent(q)
+
+    # For direct comparison questions, encyclopedia-style references are usually cleaner than news snippets.
+    if intent == "compare":
+        cmp_ans = _try_compare_wikipedia(q, timeout=min(timeout, 12))
+        if cmp_ans is not None:
+            ans, src = cmp_ans
+            return ans, src, "web_compare_wikipedia"
+
+    if intent == "economy":
+        stock = _try_stock_answer(q, max_items=max_items, timeout=timeout)
+        if stock is not None:
+            return stock
+
+    if intent == "economy":
+        infl = _try_uk_us_inflation_answer(q, max_items=max_items, timeout=timeout)
+        if infl is not None:
+            return infl
+
+    # Intent-specific path for recent SpaceX launch outcomes.
+    if intent == "launches" and "spacex" in q.lower():
+        sx = _search_spacex_recent_launches(max_items=max_items, timeout=timeout)
+        if sx:
+            ans = _format_spacex_launches_answer(sx)
+            return ans, [it["link"] for it in sx[:3] if it.get("link")], "web_spacex"
+
+    ddg_items = _search_general_web(q, max_items=max_items, timeout=timeout)
+    if ddg_items:
+        ans = _format_general_web_answer(q, ddg_items)
+        if (not _intent_answer_quality_ok(q, ans)) or _looks_generic_or_bad_answer(ans):
+            retry_q = _intent_retry_query(q)
+            retry_items = _search_general_web(retry_q, max_items=max_items, timeout=timeout)
+            if retry_items:
+                retry_ans = _format_general_web_answer(q, retry_items)
+                if _intent_answer_quality_ok(q, retry_ans) and (not _looks_generic_or_bad_answer(retry_ans)):
+                    return retry_ans, [it["link"] for it in retry_items[:3] if it.get("link")], "web_general_retry"
+        return ans, [it["link"] for it in ddg_items[:3] if it.get("link")], "web_general"
+
+    wiki_items = _rank_web_hits(
+        q,
+        _search_wikipedia_pages(q, max_items=max_items, timeout=min(timeout, 12)),
+        max_items=max_items,
+    )
+    if wiki_items:
+        ans = _format_general_web_answer(q, wiki_items)
+        if _intent_answer_quality_ok(q, ans) and (not _looks_generic_or_bad_answer(ans)):
+            return ans, [it["link"] for it in wiki_items[:3] if it.get("link")], "web_wikipedia_search"
+
+    if _allow_news_fallback(intent):
+        news_items = _search_google_news(q, max_items=max_items, timeout=timeout)
+        if news_items:
+            ans = _format_latest_answer(q, news_items)
+            return ans, [it["link"] for it in news_items[:3] if it.get("link")], "web_general_news_fallback"
+
+    return None
 
 
 def _needs_general_web_search(user: str) -> bool:
@@ -804,8 +1577,21 @@ def _search_google_news(query: str, max_items: int = 5, timeout: int = 15) -> Li
             title = _clean_news_title(item.findtext("title", default=""))
             link = normalize(item.findtext("link", default=""))
             pub = normalize(item.findtext("pubDate", default=""))
+            desc = _strip_tags(item.findtext("description", default=""))
+            source_el = item.find("source")
+            source_name = normalize(source_el.text if source_el is not None else "")
+            source_url = normalize(source_el.get("url", "")) if source_el is not None else ""
             if title and link:
-                all_items.append({"title": title, "link": link, "pub_date": pub})
+                all_items.append(
+                    {
+                        "title": title,
+                        "link": link,
+                        "pub_date": pub,
+                        "snippet": desc,
+                        "source_name": source_name,
+                        "source_url": source_url,
+                    }
+                )
 
     # dedupe by link/title, then rank by relevance + recency
     dedup: Dict[str, Dict[str, str]] = {}
@@ -819,33 +1605,30 @@ def _search_google_news(query: str, max_items: int = 5, timeout: int = 15) -> Li
         reverse=True,
     )
     return ranked[:max_items]
-    txt = _fetch_text(url, timeout=timeout)
-    if not txt:
-        return []
-    try:
-        root = ET.fromstring(txt)
-    except Exception:
-        return []
-    out: List[Dict[str, str]] = []
-    for item in root.findall("./channel/item"):
-        title = normalize(item.findtext("title", default=""))
-        link = normalize(item.findtext("link", default=""))
-        pub = normalize(item.findtext("pubDate", default=""))
-        if title and link:
-            out.append({"title": title, "link": link, "pub_date": pub})
-        if len(out) >= max_items:
-            break
-    return out
 
 
 def _format_latest_answer(query: str, items: List[Dict[str, str]]) -> str:
     if not items:
         return "I couldn't find recent sources for that query right now."
-    titles = [_clean_news_title(it["title"]) for it in items]
-    t1 = titles[0].rstrip(".")
-    t2 = titles[1].rstrip(".") if len(titles) > 1 else titles[0].rstrip(".")
-    resp = f"Recent coverage says: {t1}. Another report says: {t2}."
-    src = "\n".join(f"- {it['link']}" for it in items[:3])
+    lead = items[0]
+    second = items[1] if len(items) > 1 else items[0]
+    t1 = _clean_news_title(lead.get("title", "")).rstrip(".")
+    t2 = _clean_news_title(second.get("title", "")).rstrip(".")
+    s1 = _clean_snippet(lead.get("snippet", "") or t1, max_chars=220)
+    s2 = _clean_snippet(second.get("snippet", "") or t2, max_chars=220)
+    src1 = normalize(lead.get("source_name", ""))
+    src2 = normalize(second.get("source_name", ""))
+    if src1:
+        s1 = f"{s1} ({src1})"
+    if src2:
+        s2 = f"{s2} ({src2})"
+    resp = f"Recent coverage says: {t1}. Key point: {s1}. Another report says: {t2}. Key point: {s2}."
+    links = []
+    for it in items[:3]:
+        candidate = normalize(it.get("source_url", "")) or normalize(it.get("link", ""))
+        if candidate and candidate not in links:
+            links.append(candidate)
+    src = "\n".join(f"- {u}" for u in links)
     return f"{resp}\n\nSources:\n{src}"
 
 
@@ -1285,28 +2068,28 @@ def main():
                 q_score = _latest_news_quality(user, items)
                 if q_score < 3:
                     # Fallback to broader web search when RSS news is off-topic/noisy.
-                    ddg_items = _search_general_web(
+                    web_try = _try_general_web_answer(
                         user,
                         max_items=max(1, args.web_results),
                         timeout=args.web_timeout,
                     )
-                    if ddg_items:
-                        ans = _format_general_web_answer(user, ddg_items)
+                    if web_try is not None:
+                        ans, src_urls, mode = web_try
                         print(f"Bot: {ans}\n")
                         _append_turn_log(
                             args.turn_log,
                             user=user,
                             answer=ans,
-                            mode="latest_ddg_fallback",
-                            source_urls=[it["link"] for it in ddg_items[:3]],
+                            mode=mode if mode != "web_general" else "latest_ddg_fallback",
+                            source_urls=src_urls,
                         )
                         _append_web_log(
                             args.web_log,
                             {
                                 "ts_utc": datetime.now(timezone.utc).isoformat(),
-                                "mode": "latest_ddg_fallback",
+                                "mode": mode if mode != "web_general" else "latest_ddg_fallback",
                                 "query": user,
-                                "source_urls": [it["link"] for it in ddg_items[:3]],
+                                "source_urls": src_urls,
                                 "answer": ans,
                             },
                         )
@@ -1358,55 +2141,28 @@ def main():
                 continue
 
             if _needs_general_web_search(user):
-                ddg_items = _search_general_web(
+                web_try = _try_general_web_answer(
                     user,
                     max_items=max(1, args.web_results),
                     timeout=args.web_timeout,
                 )
-                if ddg_items:
-                    ans = _format_general_web_answer(user, ddg_items)
+                if web_try is not None:
+                    ans, src_urls, mode = web_try
                     print(f"Bot: {ans}\n")
                     _append_turn_log(
                         args.turn_log,
                         user=user,
                         answer=ans,
-                        mode="web_general",
-                        source_urls=[it["link"] for it in ddg_items[:3]],
+                        mode=mode,
+                        source_urls=src_urls,
                     )
                     _append_web_log(
                         args.web_log,
                         {
                             "ts_utc": datetime.now(timezone.utc).isoformat(),
-                            "mode": "web_general",
+                            "mode": mode,
                             "query": user,
-                            "source_urls": [it["link"] for it in ddg_items[:3]],
-                            "answer": ans,
-                        },
-                    )
-                    continue
-
-                news_items = _search_google_news(
-                    user,
-                    max_items=max(1, args.web_results),
-                    timeout=args.web_timeout,
-                )
-                if news_items:
-                    ans = _format_latest_answer(user, news_items)
-                    print(f"Bot: {ans}\n")
-                    _append_turn_log(
-                        args.turn_log,
-                        user=user,
-                        answer=ans,
-                        mode="web_general_news_fallback",
-                        source_urls=[it["link"] for it in news_items[:3]],
-                    )
-                    _append_web_log(
-                        args.web_log,
-                        {
-                            "ts_utc": datetime.now(timezone.utc).isoformat(),
-                            "mode": "web_general_news_fallback",
-                            "query": user,
-                            "source_urls": [it["link"] for it in news_items[:3]],
+                            "source_urls": src_urls,
                             "answer": ans,
                         },
                     )
@@ -1532,20 +2288,20 @@ def main():
                         continue
 
                 if _needs_general_web_search(user):
-                    ddg_items = _search_general_web(
+                    web_try = _try_general_web_answer(
                         user,
                         max_items=max(1, args.web_results),
                         timeout=args.web_timeout,
                     )
-                    if ddg_items:
-                        web_ans = _format_general_web_answer(user, ddg_items)
+                    if web_try is not None:
+                        web_ans, src_urls, mode = web_try
                         print(f"Bot: {web_ans}\n")
                         _append_turn_log(
                             args.turn_log,
                             user=user,
                             answer=web_ans,
-                            mode="confidence_web_general_fallback",
-                            source_urls=[it["link"] for it in ddg_items[:3]],
+                            mode=f"confidence_{mode}",
+                            source_urls=src_urls,
                             meta={
                                 "model_answer": normalize(ans),
                                 "model_avg_token_prob": round(avg_prob, 4),
@@ -1555,11 +2311,11 @@ def main():
                             args.web_log,
                             {
                                 "ts_utc": datetime.now(timezone.utc).isoformat(),
-                                "mode": "confidence_web_general_fallback",
+                                "mode": f"confidence_{mode}",
                                 "query": user,
                                 "model_answer": ans,
                                 "model_avg_token_prob": round(avg_prob, 4),
-                                "source_urls": [it["link"] for it in ddg_items[:3]],
+                                "source_urls": src_urls,
                                 "answer": web_ans,
                             },
                         )
