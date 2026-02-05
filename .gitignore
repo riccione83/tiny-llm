@@ -1,0 +1,53 @@
+# Large training data files
+data/sources_v5/
+data/
+
+old/
+rag_cache/
+# Model checkpoints (large files)
+checkpoints_v3/
+*.pt
+*.npy
+
+feedback/
+
+# Keep tokenizer files (small, needed for code to work)
+!llm_tokenizer.model
+!llm_tokenizer.vocab
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Virtual environments
+venv/
+env/
+ENV/
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Logs
+*.log
+
+# Temporary files
+*.tmp
+*.bak
+*.swp
+
+# Planning documents
+SCALING_PLAN.md
+training_log.csv
+plan.txt
