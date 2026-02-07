@@ -88,21 +88,11 @@ TRUSTED_DOMAIN_HINTS = [
     "ft.com",
     "ec.europa.eu",
     "europa.eu",
-    "nvidia.com",
-    "amd.com",
-    "intel.com",
-    "spacex.com",
     "nasa.gov",
     "nih.gov",
     "nature.com",
     "science.org",
     "who.int",
-    "tomshardware.com",
-    "anandtech.com",
-    "techpowerup.com",
-    "space.com",
-    "ons.gov.uk",
-    "bls.gov",
 ]
 
 LOW_QUALITY_DOMAIN_HINTS = [
@@ -115,7 +105,6 @@ LOW_QUALITY_DOMAIN_HINTS = [
     "tiktok.com",
 ]
 
-_PAGE_TEXT_CACHE: Dict[str, str] = {}
 
 
 def normalize(text: str) -> str:
@@ -141,13 +130,30 @@ def canonicalize_user_message(user: str) -> str:
     u = user.strip()
     low = u.lower()
 
-    # Match "Summarize in 2 sentences:" prefix
+    # Match "Summarize in 2 sentences:" prefix (including "exactly")
+    if low.startswith("summarize in exactly 2 sentences") or low.startswith("summarize in exactly two sentences"):
+        body = u.split(":", 1)[1].strip() if ":" in u else u.split("sentences", 1)[1].strip()
+        return "Summarize in 2 sentences:\n" + body
     if low.startswith("summarize in 2 sentences:"):
         body = u.split(":", 1)[1].strip()
         return "Summarize in 2 sentences:\n" + body
 
     # Match "Summarize:" prefix
     if low.startswith("summarize:"):
+        body = u.split(":", 1)[1].strip()
+        return "Summarize in 2 sentences:\n" + body
+
+    # Italian summarization variants
+    if low.startswith("riassumi in 2 frasi:") or low.startswith("riassumi in due frasi:") or low.startswith("riassumi in esattamente 2 frasi:"):
+        body = u.split(":", 1)[1].strip()
+        return "Summarize in 2 sentences:\n" + body
+    if low.startswith("riassumi:"):
+        body = u.split(":", 1)[1].strip()
+        return "Summarize in 2 sentences:\n" + body
+    if low.startswith("cosa dice questo articolo:"):
+        body = u.split(":", 1)[1].strip()
+        return "Summarize in 2 sentences:\n" + body
+    if low.startswith("what does this article say:"):
         body = u.split(":", 1)[1].strip()
         return "Summarize in 2 sentences:\n" + body
 
@@ -196,30 +202,6 @@ def _fetch_raw_html(url: str, timeout: int = 15) -> Optional[str]:
             return r.read().decode("utf-8", errors="ignore")
     except Exception:
         return None
-
-
-def _post_json(url: str, payload: Dict[str, object], timeout: int = 15) -> Optional[Dict[str, object]]:
-    data = json.dumps(payload).encode("utf-8")
-    req = urllib.request.Request(
-        url,
-        data=data,
-        method="POST",
-        headers={
-            "User-Agent": "Mozilla/5.0 (compatible; tiny-llm-bot/1.0)",
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-        },
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as r:
-            text = r.read().decode("utf-8", errors="ignore")
-    except Exception:
-        return None
-    try:
-        obj = json.loads(text)
-    except Exception:
-        return None
-    return obj if isinstance(obj, dict) else None
 
 
 def _jina_proxy_url(url: str) -> str:
@@ -328,13 +310,25 @@ def try_extractive_summary_reply(user: str) -> Optional[str]:
 
     mode = None
     body = ""
-    if low.startswith("summarize as exactly 2 bullet points:"):
+    if low.startswith("summarize as exactly 2 bullet points:") or low.startswith("summarize as exactly two bullet points:"):
         mode = "bullet"
         body = u.split(":", 1)[1].strip()
+    elif low.startswith("summarize in exactly 2 sentences") or low.startswith("summarize in exactly two sentences"):
+        mode = "two"
+        body = u.split(":", 1)[1].strip() if ":" in u else u.split("sentences", 1)[1].strip()
     elif low.startswith("summarize in 2 sentences:"):
         mode = "two"
         body = u.split(":", 1)[1].strip()
     elif low.startswith("summarize:"):
+        mode = "two"
+        body = u.split(":", 1)[1].strip()
+    elif low.startswith("riassumi come esattamente 2 punti elenco:") or low.startswith("riassumi come 2 punti elenco:"):
+        mode = "bullet"
+        body = u.split(":", 1)[1].strip()
+    elif low.startswith("riassumi in 2 frasi:") or low.startswith("riassumi in due frasi:") or low.startswith("riassumi in esattamente 2 frasi:"):
+        mode = "two"
+        body = u.split(":", 1)[1].strip()
+    elif low.startswith("riassumi:"):
         mode = "two"
         body = u.split(":", 1)[1].strip()
     elif low.startswith("cosa dice questo articolo:"):
@@ -376,6 +370,382 @@ def _summarize_plain_text(text: str, bullets: bool = False) -> Optional[str]:
     return f"{pair[0]} {pair[1]}".strip()
 
 
+def _sentence_count(text: str) -> int:
+    parts = re.split(r"(?<=[.!?])\s+", (text or "").strip())
+    parts = [p for p in parts if p.strip()]
+    return len(parts)
+
+
+def _two_sentence_exact(answer: str) -> bool:
+    return _sentence_count(answer) == 2
+
+
+def _exactly_two_bullets(answer: str) -> bool:
+    lines = [ln for ln in (answer or "").splitlines() if ln.strip()]
+    if len(lines) != 2:
+        return False
+    return all(ln.lstrip().startswith("-") for ln in lines)
+
+
+def _is_number_only(answer: str) -> bool:
+    return re.fullmatch(r"-?\d+(?:\.\d+)?", (answer or "").strip()) is not None
+
+
+def _is_yes_no_only(answer: str) -> bool:
+    return (answer or "").strip().upper() in {"YES", "NO", "SI"}
+
+
+def _strip_code_fence(text: str) -> str:
+    t = (text or "").strip()
+    if t.startswith("```"):
+        t = re.sub(r"^```[a-zA-Z]*\n", "", t)
+        t = re.sub(r"\n```$", "", t.strip())
+    return t.strip()
+
+
+def _is_json_only(answer: str) -> bool:
+    t = _strip_code_fence(answer)
+    if not t:
+        return False
+    if not (t.startswith("{") or t.startswith("[")):
+        return False
+    try:
+        obj = json.loads(t)
+    except Exception:
+        return False
+    return isinstance(obj, (dict, list))
+
+
+def _extract_first_number(text: str) -> Optional[str]:
+    m = re.search(r"-?\d+(?:\.\d+)?", text or "")
+    return m.group(0) if m else None
+
+
+def _extract_yes_no(text: str) -> Optional[str]:
+    low = (text or "").lower()
+    if re.search(r"\byes\b", low):
+        return "YES"
+    if re.search(r"\bno\b", low):
+        return "NO"
+    if re.search(r"\btrue\b", low):
+        return "YES"
+    if re.search(r"\bfalse\b", low):
+        return "NO"
+    if re.search(r"\bsi\b", low):
+        return "SI"
+    return None
+
+
+def _extract_json_blob(text: str) -> Optional[str]:
+    t = _strip_code_fence(text)
+    if not t:
+        return None
+    for open_ch, close_ch in [("{", "}"), ("[", "]")]:
+        if open_ch in t and close_ch in t:
+            sub = t[t.find(open_ch) : t.rfind(close_ch) + 1]
+            try:
+                obj = json.loads(sub)
+            except Exception:
+                continue
+            return json.dumps(obj, ensure_ascii=False)
+    return None
+
+
+def try_simple_compare_reply(
+    user: str,
+    prefer_it: bool = False,
+    yesno_only: bool = False,
+) -> Optional[str]:
+    text = normalize(user).lower()
+
+    def yn(ok: bool) -> str:
+        if prefer_it:
+            return "SI" if ok else "NO"
+        return "YES" if ok else "NO"
+
+    m_gt = re.search(
+        r"(-?\d+(?:\.\d+)?)\s*(?:greater than|larger than|bigger than|maggiore di|piu grande di)\s*(-?\d+(?:\.\d+)?)",
+        text,
+    )
+    if m_gt:
+        a = float(m_gt.group(1))
+        b = float(m_gt.group(2))
+        out = yn(a > b)
+        if yesno_only:
+            return out
+        if out in {"YES", "SI"}:
+            return "Yes."
+        return "No."
+
+    m_lt = re.search(
+        r"(-?\d+(?:\.\d+)?)\s*(?:less than|smaller than|minore di|piu piccolo di)\s*(-?\d+(?:\.\d+)?)",
+        text,
+    )
+    if m_lt:
+        a = float(m_lt.group(1))
+        b = float(m_lt.group(2))
+        out = yn(a < b)
+        if yesno_only:
+            return out
+        if out in {"YES", "SI"}:
+            return "Yes."
+        return "No."
+
+    m_sym = re.search(r"(-?\d+(?:\.\d+)?)\s*([<>])\s*(-?\d+(?:\.\d+)?)", text)
+    if m_sym:
+        a = float(m_sym.group(1))
+        b = float(m_sym.group(3))
+        op = m_sym.group(2)
+        out = yn(a > b if op == ">" else a < b)
+        if yesno_only:
+            return out
+        if out in {"YES", "SI"}:
+            return "Yes."
+        return "No."
+
+    return None
+
+
+def try_deterministic_yesno_reply(user: str, prefer_it: bool = False) -> Optional[str]:
+    out = try_simple_compare_reply(user, prefer_it=prefer_it, yesno_only=True)
+    if out is not None:
+        return out
+    out = _infer_yes_no_from_math(user, prefer_it=prefer_it)
+    if out is not None:
+        return out
+    return None
+
+
+def _infer_yes_no_from_math(user: str, prefer_it: bool = False) -> Optional[str]:
+    text = normalize(user).lower()
+    m = re.search(r"(-?\d+(?:\.\d+)?)\s*([+\-*/])\s*(-?\d+(?:\.\d+)?)\s*=\s*(-?\d+(?:\.\d+)?)", text)
+    if m:
+        a = float(m.group(1))
+        op = m.group(2)
+        b = float(m.group(3))
+        c = float(m.group(4))
+        try:
+            if op == "+":
+                val = a + b
+            elif op == "-":
+                val = a - b
+            elif op == "*":
+                val = a * b
+            else:
+                if abs(b) < 1e-12:
+                    return None
+                val = a / b
+            ok = abs(val - c) < 1e-9
+            if prefer_it:
+                return "SI" if ok else "NO"
+            return "YES" if ok else "NO"
+        except Exception:
+            return None
+
+    m2 = re.search(r"(-?\d+(?:\.\d+)?)\s*(?:greater than|larger than|maggiore di)\s*(-?\d+(?:\.\d+)?)", text)
+    if m2:
+        a = float(m2.group(1))
+        b = float(m2.group(2))
+        ok = a > b
+        if prefer_it:
+            return "SI" if ok else "NO"
+        return "YES" if ok else "NO"
+
+    m3 = re.search(r"(-?\d+(?:\.\d+)?)\s*(?:less than|minore di)\s*(-?\d+(?:\.\d+)?)", text)
+    if m3:
+        a = float(m3.group(1))
+        b = float(m3.group(2))
+        ok = a < b
+        if prefer_it:
+            return "SI" if ok else "NO"
+        return "YES" if ok else "NO"
+
+    return None
+
+
+def _is_summary_request(user: str) -> bool:
+    low = normalize(user).lower()
+    return low.startswith(
+        (
+            "summarize",
+            "riassumi",
+            "cosa dice questo articolo",
+            "what does this article say",
+        )
+    )
+
+
+def _detect_format_spec(user: str) -> Dict[str, bool]:
+    low = normalize(user).lower()
+    number_only = any(
+        h in low
+        for h in [
+            "answer with a number only",
+            "number only",
+            "only a number",
+            "numeric answer only",
+            "solo un numero",
+            "solo numero",
+            "rispondi solo con un numero",
+        ]
+    )
+    yes_no_only = any(
+        h in low
+        for h in [
+            "reply yes or no only",
+            "yes or no only",
+            "answer yes or no only",
+            "reply yes/no only",
+            "reply with yes or no",
+            "replay with yes or no",
+            "yes or no",
+            "rispondi si o no",
+            "rispondi con si o no",
+            "solo si o no",
+            "si o no soltanto",
+        ]
+    )
+    json_only = ("json" in low) and any(
+        h in low
+        for h in [
+            "json only",
+            "only json",
+            "return json",
+            "output json",
+            "respond in json",
+            "format json",
+            "formato json",
+            "solo json",
+            "rispondi in json",
+        ]
+    )
+    two_bullets = any(
+        h in low
+        for h in [
+            "exactly 2 bullet points",
+            "exactly two bullet points",
+            "summarize as exactly 2 bullet points",
+            "summarize as exactly two bullet points",
+            "2 bullet points",
+            "2 bullets",
+            "due punti elenco",
+            "2 punti elenco",
+        ]
+    )
+    two_sentences = any(
+        h in low
+        for h in [
+            "summarize in 2 sentences",
+            "summarize in exactly 2 sentences",
+            "summarize in exactly two sentences",
+            "2 sentences",
+            "two sentences",
+            "riassumi in 2 frasi",
+            "riassumi in due frasi",
+            "2 frasi",
+            "due frasi",
+        ]
+    )
+    return {
+        "number_only": number_only,
+        "yes_no_only": yes_no_only,
+        "json_only": json_only,
+        "two_bullets": two_bullets,
+        "two_sentences": two_sentences,
+    }
+
+
+def _prefer_italian_yes_no(user: str) -> bool:
+    low = normalize(user).lower()
+    return any(
+        h in low
+        for h in [
+            "rispondi si o no",
+            "solo si o no",
+            "si o no soltanto",
+        ]
+    )
+
+
+def _has_strict_format(spec: Dict[str, bool]) -> bool:
+    return any(spec.values())
+
+
+def _format_ok(spec: Dict[str, bool], answer: str) -> bool:
+    if spec.get("number_only") and not _is_number_only(answer):
+        return False
+    if spec.get("yes_no_only") and not _is_yes_no_only(answer):
+        return False
+    if spec.get("json_only") and not _is_json_only(answer):
+        return False
+    if spec.get("two_bullets") and not _exactly_two_bullets(answer):
+        return False
+    if spec.get("two_sentences") and not _two_sentence_exact(answer):
+        return False
+    return True
+
+
+def _apply_format_repair(user: str, answer: str) -> Tuple[str, Optional[str]]:
+    spec = _detect_format_spec(user)
+    if not _has_strict_format(spec):
+        return answer, None
+    if _format_ok(spec, answer):
+        if spec.get("yes_no_only"):
+            prefer_it = _prefer_italian_yes_no(user)
+            deterministic = try_deterministic_yesno_reply(user, prefer_it=prefer_it)
+            if deterministic is not None:
+                return deterministic, "repair_yesno_deterministic"
+        return answer, None
+
+    if spec.get("number_only"):
+        num = _extract_first_number(answer) or try_simple_math_reply(user)
+        if num is not None:
+            return num, "repair_number"
+        return "0", "repair_number_default"
+
+    if spec.get("yes_no_only"):
+        prefer_it = _prefer_italian_yes_no(user)
+        deterministic = try_deterministic_yesno_reply(user, prefer_it=prefer_it)
+        if deterministic is not None:
+            return deterministic, "repair_yesno_deterministic"
+        yn = _extract_yes_no(answer)
+        if yn is not None:
+            if prefer_it:
+                return ("SI" if yn in {"YES", "SI"} else "NO"), "repair_yesno"
+            return ("YES" if yn in {"YES", "SI"} else "NO"), "repair_yesno"
+        yn = _infer_yes_no_from_math(user, prefer_it=prefer_it)
+        if yn is not None:
+            return yn, "repair_yesno"
+        return "NO", "repair_yesno_default"
+
+    if spec.get("json_only"):
+        blob = _extract_json_blob(answer)
+        if blob is not None:
+            return blob, "repair_json"
+        return "{}", "repair_json_default"
+
+    if spec.get("two_bullets") or spec.get("two_sentences"):
+        if _is_summary_request(user):
+            summ = try_extractive_summary_reply(user)
+            if summ and _format_ok(spec, summ):
+                return summ, "repair_extractive_summary"
+
+        pair = _best_sentence_pair(answer)
+        if pair:
+            if spec.get("two_bullets"):
+                fixed = f"- {pair[0]}\n- {pair[1]}"
+            else:
+                fixed = f"{pair[0]} {pair[1]}".strip()
+            if _format_ok(spec, fixed):
+                return fixed, "repair_from_answer"
+
+        if spec.get("two_bullets"):
+            return "- ...\n- ...", "repair_bullets_default"
+        return "I don't know. I don't know.", "repair_sentences_default"
+
+    return answer, None
+
+
 def _needs_latest_web_search(user: str) -> bool:
     low = (user or "").lower()
     triggers = [
@@ -392,26 +762,8 @@ def _needs_latest_web_search(user: str) -> bool:
     return any(t in low for t in triggers)
 
 
-def _query_intent(user: str) -> str:
-    low = normalize(user).lower()
-    if any(k in low for k in ("tourist attractions", "travel tips", "visit tokyo", "visiting tokyo", "london")):
-        return "travel"
-    if "spacex" in low and any(k in low for k in ("launch", "outcome", "mission")):
-        return "launches"
-    if "regulation" in low and "ai" in low and any(k in low for k in ("eu", "europe", "european")):
-        return "regulation"
-    if any(k in low for k in ("stock", "inflation", "market", "economy", "economic", "investments")):
-        return "economy"
-    if any(k in low for k in ("compare", "vs", "versus", "differ", "difference")):
-        return "compare"
-    if any(k in low for k in ("spec", "key features", "feature")) and any(k in low for k in ("gpu", "cpu", "intel", "nvidia", "amd")):
-        return "specs"
-    return "general"
-
-
 def _prefer_general_web(user: str) -> bool:
-    intent = _query_intent(user)
-    return intent in {"specs", "compare", "launches", "travel", "regulation", "economy"}
+    return False
 
 
 def _allow_news_fallback(intent: str) -> bool:
@@ -503,39 +855,14 @@ def _try_entity_answer(user: str, timeout: int = 15) -> Optional[Tuple[str, List
     return ans, src
 
 
-def _extract_compare_entities(user: str) -> Optional[Tuple[str, str]]:
-    q = normalize(user).strip(" ?.")
-    low = q.lower()
-    patterns = [
-        r"compare\s+(.+?)\s+(?:vs|versus)\s+(.+)$",
-        r"difference between\s+(.+?)\s+and\s+(.+)$",
-        r"how do\s+(.+?)\s+and\s+(.+?)\s+differ$",
-    ]
-    for pat in patterns:
-        m = re.search(pat, low, flags=re.IGNORECASE)
-        if not m:
-            continue
-        a = normalize(m.group(1)).strip(" ,.")
-        b = normalize(m.group(2)).strip(" ,.")
-        if a and b and a != b:
-            return a, b
-    return None
-
-
 def _fuzzy_wiki_entity_candidates(entity: str) -> List[str]:
     e = normalize(entity).strip(" ,.")
     low = e.lower()
     out = [e]
     cleaned = low
-    cleaned = re.sub(r"^nvidia\s+", "", cleaned)
     cleaned = re.sub(r"\b(architectures?|architecture|gpus?|cpus?)\b", "", cleaned).strip()
     if cleaned and cleaned != low:
         out.append(cleaned)
-
-    if "blackwell" in low:
-        out += ["Blackwell (microarchitecture)", "Blackwell architecture"]
-    if "ada lovelace" in low or ("ada" in low and "lovelace" in low):
-        out += ["Ada Lovelace (microarchitecture)", "Ada Lovelace architecture"]
 
     uniq: List[str] = []
     seen = set()
@@ -562,35 +889,6 @@ def _wikipedia_summary_fuzzy(entity: str, timeout: int = 12) -> Optional[Dict[st
     return None
 
 
-def _try_compare_wikipedia(user: str, timeout: int = 12) -> Optional[Tuple[str, List[str]]]:
-    pair = _extract_compare_entities(user)
-    if not pair:
-        return None
-    a, b = pair
-    wa = _wikipedia_summary_fuzzy(a, timeout=timeout)
-    wb = _wikipedia_summary_fuzzy(b, timeout=timeout)
-    if not wa or not wb:
-        return None
-
-    sa = _split_sentences(wa.get("extract", ""))
-    sb = _split_sentences(wb.get("extract", ""))
-    pa = sa[0] if sa else wa.get("extract", "")
-    pb = sb[0] if sb else wb.get("extract", "")
-    ans = (
-        "Comparison overview from reference sources:\n"
-        f"- {wa.get('title', a)}: {pa}\n"
-        f"- {wb.get('title', b)}: {pb}"
-    )
-    src: List[str] = []
-    if wa.get("url"):
-        src.append(wa["url"])
-    if wb.get("url"):
-        src.append(wb["url"])
-    if src:
-        ans += "\n\nSources:\n" + "\n".join(f"- {u}" for u in src[:3])
-    return ans, src[:3]
-
-
 def _clean_news_title(title: str) -> str:
     t = normalize(title)
     return re.sub(r"\s*-\s*[^-]+$", "", t).strip()
@@ -604,6 +902,65 @@ def _domain_from_url(url: str) -> str:
     if net.startswith("www."):
         net = net[4:]
     return net
+
+
+def _official_only_requested(query: str) -> bool:
+    low = normalize(query).lower()
+    return any(
+        x in low
+        for x in (
+            "official sources only",
+            "official source only",
+            "only official sources",
+            "solo fonti ufficiali",
+            "fonti ufficiali",
+        )
+    )
+
+
+def _allowed_official_domains(query: str) -> List[str]:
+    low = normalize(query).lower()
+    toks = [t for t in re.findall(r"[a-z0-9]+", low) if len(t) >= 4 and t not in QUERY_STOPWORDS]
+    generic = {
+        "official",
+        "sources",
+        "source",
+        "only",
+        "latest",
+        "recent",
+        "current",
+        "what",
+        "which",
+        "where",
+        "when",
+        "using",
+        "with",
+        "from",
+    }
+    out = [t for t in toks if t not in generic][:5]
+    out.extend([".gov", ".edu"])
+    # dedupe preserve order
+    uniq: List[str] = []
+    seen = set()
+    for x in out:
+        if x in seen:
+            continue
+        seen.add(x)
+        uniq.append(x)
+    return uniq
+
+
+def _is_allowed_official_domain(url: str, allowed: List[str]) -> bool:
+    d = _domain_from_url(url)
+    if not d:
+        return False
+    for a in allowed:
+        if a.startswith("."):
+            if d.endswith(a):
+                return True
+        elif a in d:
+            return True
+    return False
 
 
 def _decode_ddg_redirect(url: str) -> str:
@@ -712,20 +1069,9 @@ def _web_hit_score(query: str, item: Dict[str, str]) -> int:
         score -= 4
 
     ql = query.lower()
-    intent = _query_intent(query)
-    if ("latest" in ql or "recent" in ql or "ultim" in ql) and ("launch" in text or "announc" in text or "new" in text):
+    if ("latest" in ql or "recent" in ql or "ultim" in ql) and ("latest" in text or "new" in text or "update" in text):
         score += 2
-    if "gpu" in ql and ("rtx" in text or "geforce" in text):
-        score += 3
-    if "spec" in ql and ("spec" in text or "gb" in text or "memory" in text or "cuda" in text):
-        score += 2
-    if "compare" in ql and ("vs" in text or "versus" in text or "compare" in text):
-        score += 2
-    if intent == "launches" and ("launch" in text or "mission" in text or "outcome" in text or "land" in text):
-        score += 3
-    if intent == "regulation" and ("act" in text or "regulation" in text or "compliance" in text):
-        score += 2
-    if intent == "economy" and ("inflation" in text or "market" in text or "stock" in text):
+    if "compare" in ql and ("vs" in text or "versus" in text or "compare" in text or "difference" in text):
         score += 2
     return score
 
@@ -786,451 +1132,6 @@ def _search_wikipedia_pages(query: str, max_items: int = 5, timeout: int = 12) -
     return out
 
 
-def _get_page_text_cached(url: str, timeout: int = WEB_FETCH_TIMEOUT) -> Optional[str]:
-    key = normalize(url)
-    if not key:
-        return None
-    if key in _PAGE_TEXT_CACHE:
-        return _PAGE_TEXT_CACHE[key]
-    txt = _fetch_article_text(key, timeout=timeout)
-    if txt:
-        txt = _clean_web_noise(txt)
-    if txt and len(txt) >= 80:
-        _PAGE_TEXT_CACHE[key] = txt
-        return txt
-    return None
-
-
-def _score_sentence_for_query(sentence: str, query_tokens: List[str], intent: str) -> int:
-    low = sentence.lower()
-    overlap = sum(1 for t in query_tokens if t in low)
-    score = overlap * 3
-    if intent == "specs":
-        score += 2 * _numeric_signal_count(sentence)
-        if any(k in low for k in ("cuda", "memory", "gb", "ghz", "watt", "tdp", "bandwidth")):
-            score += 3
-    if intent == "compare" and any(k in low for k in ("vs", "versus", "compared", "difference", "higher", "lower")):
-        score += 3
-    if intent == "launches" and any(k in low for k in ("launch", "mission", "success", "failed", "landed")):
-        score += 3
-    return score
-
-
-def _collect_evidence_sentences(query: str, items: List[Dict[str, str]], max_items: int = 2) -> List[Dict[str, str]]:
-    intent = _query_intent(query)
-    q_tokens = _query_tokens(query)
-    out: List[Dict[str, str]] = []
-    for it in items[: max(1, max_items)]:
-        url = normalize(it.get("link", ""))
-        if not url:
-            continue
-        page = _get_page_text_cached(url)
-        if not page:
-            continue
-        sents = _split_sentences(page)
-        if not sents:
-            continue
-        ranked = sorted(
-            (( _score_sentence_for_query(s, q_tokens, intent), s) for s in sents if len(s.split()) >= 6),
-            key=lambda x: x[0],
-            reverse=True,
-        )
-        best = [s for sc, s in ranked[:2] if sc > 0]
-        if not best:
-            continue
-        out.append({"title": normalize(it.get("title", "")), "link": url, "evidence": " ".join(best)})
-    return out
-
-
-def _has_uk_us_inflation_intent(query: str) -> bool:
-    low = normalize(query).lower()
-    if "inflation" not in low and "cpi" not in low:
-        return False
-    has_uk = (" uk " in f" {low} ") or ("united kingdom" in low) or ("britain" in low)
-    has_us = (re.search(r"\bus\b", low) is not None) or ("united states" in low) or ("america" in low)
-    return has_uk and has_us
-
-
-def _has_stock_intent(query: str) -> bool:
-    low = normalize(query).lower()
-    return ("stock" in low) or ("shares" in low) or ("ticker" in low) or ("nvda" in low)
-
-
-def _extract_stock_symbols(query: str) -> List[str]:
-    low = normalize(query).lower()
-    mapped: List[str] = []
-    name_map = {
-        "nvidia": "NVDA",
-        "amd": "AMD",
-        "intel": "INTC",
-        "microsoft": "MSFT",
-        "apple": "AAPL",
-        "amazon": "AMZN",
-        "google": "GOOGL",
-        "alphabet": "GOOGL",
-        "meta": "META",
-        "tesla": "TSLA",
-    }
-    for k, v in name_map.items():
-        if k in low:
-            mapped.append(v)
-
-    for t in re.findall(r"\b[A-Z]{1,5}\b", query):
-        if t.isalpha():
-            mapped.append(t.upper())
-
-    if "nvda" in low:
-        mapped.append("NVDA")
-
-    uniq: List[str] = []
-    seen = set()
-    for s in mapped:
-        if s in seen:
-            continue
-        seen.add(s)
-        uniq.append(s)
-    return uniq[:3]
-
-
-def _fetch_stooq_daily(symbol: str, timeout: int = 12) -> Optional[Dict[str, float | str]]:
-    sym = normalize(symbol).upper()
-    if not sym:
-        return None
-    url = f"https://stooq.com/q/d/l/?s={sym.lower()}.us&i=d"
-    txt = _fetch_text(url, timeout=timeout)
-    if not txt:
-        return None
-    lines = [x.strip() for x in txt.splitlines() if x.strip()]
-    if len(lines) < 3:
-        return None
-    # CSV: Date,Open,High,Low,Close,Volume
-    def parse_row(r: str) -> Optional[Tuple[str, float]]:
-        p = r.split(",")
-        if len(p) < 5:
-            return None
-        d = p[0].strip()
-        try:
-            c = float(p[4])
-        except Exception:
-            return None
-        return d, c
-
-    last = parse_row(lines[-1])
-    prev = parse_row(lines[-2])
-    if not last or not prev:
-        return None
-    d_last, c_last = last
-    _, c_prev = prev
-    if abs(c_prev) < 1e-12:
-        return None
-    pct = (c_last / c_prev - 1.0) * 100.0
-    return {"symbol": sym, "date": d_last, "close": c_last, "change_pct": pct}
-
-
-def _fetch_fred_series_rows(series_id: str, timeout: int = 12) -> List[Tuple[str, float]]:
-    url = f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={urllib.parse.quote_plus(series_id)}"
-    txt = _fetch_text(url, timeout=timeout)
-    if not txt:
-        return []
-    rows: List[Tuple[str, float]] = []
-    for line in txt.splitlines()[1:]:
-        parts = line.split(",", 1)
-        if len(parts) != 2:
-            continue
-        d, v = parts[0].strip(), parts[1].strip()
-        if not d or not v or v == ".":
-            continue
-        try:
-            fv = float(v)
-        except Exception:
-            continue
-        rows.append((d, fv))
-    return rows
-
-
-def _fred_latest_and_yoy(series_id: str, timeout: int = 12) -> Optional[Dict[str, float | str]]:
-    rows = _fetch_fred_series_rows(series_id, timeout=timeout)
-    if len(rows) < 13:
-        return None
-    d_last, v_last = rows[-1]
-    _, v_prev = rows[-13]
-    if abs(v_prev) < 1e-12:
-        return None
-    yoy = (v_last / v_prev - 1.0) * 100.0
-    return {"date": d_last, "value": v_last, "yoy": yoy}
-
-
-def _best_percent_sentence(text: str, country_terms: List[str]) -> str:
-    sents = _split_sentences(text)
-    best = ""
-    best_score = -1
-    for s in sents:
-        low = s.lower()
-        if "%" not in s and not re.search(r"\b\d+(?:\.\d+)?\b", s):
-            continue
-        score = 0
-        score += 2 * sum(1 for t in country_terms if t in low)
-        if "inflation" in low or "cpi" in low:
-            score += 3
-        score += _numeric_signal_count(s)
-        if score > best_score:
-            best = s
-            best_score = score
-    return normalize(best)
-
-
-def _pick_primary_source(items: List[Dict[str, str]], prefer_domains: List[str]) -> Optional[Dict[str, str]]:
-    if not items:
-        return None
-    for it in items:
-        d = _domain_from_url(it.get("link", ""))
-        if any(h in d for h in prefer_domains):
-            return it
-    return items[0]
-
-
-def _try_uk_us_inflation_answer(query: str, max_items: int = 5, timeout: int = 15) -> Optional[Tuple[str, List[str], str]]:
-    if not _has_uk_us_inflation_intent(query):
-        return None
-
-    # Prefer deterministic numeric source (FRED CSV mirrors) for a stable answer format.
-    uk = _fred_latest_and_yoy("GBRCPIALLMINMEI", timeout=min(timeout, 12))
-    us = _fred_latest_and_yoy("CPIAUCSL", timeout=min(timeout, 12))
-    if uk and us:
-        uk_date = str(uk["date"])
-        us_date = str(us["date"])
-        uk_val = float(uk["value"])
-        us_val = float(us["value"])
-        uk_yoy = float(uk["yoy"])
-        us_yoy = float(us["yoy"])
-        ans = (
-            "Current inflation snapshot (UK vs US, latest available data):\n"
-            f"- UK ({uk_date}): CPI index {uk_val:.2f}, approx YoY {uk_yoy:.2f}%.\n"
-            f"- US ({us_date}): CPI index {us_val:.2f}, approx YoY {us_yoy:.2f}%."
-        )
-        src = [
-            "https://fred.stlouisfed.org/series/GBRCPIALLMINMEI",
-            "https://fred.stlouisfed.org/series/CPIAUCSL",
-        ]
-        ans += "\n\nSources:\n" + "\n".join(f"- {u}" for u in src)
-        return ans, src, "web_inflation_official"
-
-    uk_hits = _search_general_web("UK inflation rate latest ONS CPI", max_items=max_items, timeout=timeout)
-    us_hits = _search_general_web("US inflation rate latest BLS CPI", max_items=max_items, timeout=timeout)
-    uk_src = _pick_primary_source(uk_hits, ["ons.gov.uk", "ft.com", "bbc.com"])
-    us_src = _pick_primary_source(us_hits, ["bls.gov", "reuters.com", "ft.com"])
-    if not uk_src or not us_src:
-        return None
-
-    uk_text = _get_page_text_cached(uk_src.get("link", ""), timeout=min(timeout, WEB_FETCH_TIMEOUT))
-    us_text = _get_page_text_cached(us_src.get("link", ""), timeout=min(timeout, WEB_FETCH_TIMEOUT))
-
-    uk_line = _best_percent_sentence(uk_text or (uk_src.get("snippet", "") or ""), ["uk", "united kingdom", "britain"])
-    us_line = _best_percent_sentence(us_text or (us_src.get("snippet", "") or ""), ["us", "united states", "america"])
-
-    if not uk_line:
-        uk_line = _clean_snippet(uk_src.get("snippet", "") or uk_src.get("title", ""), max_chars=220)
-    if not us_line:
-        us_line = _clean_snippet(us_src.get("snippet", "") or us_src.get("title", ""), max_chars=220)
-
-    # Require at least one numeric signal for each side; otherwise it's too vague.
-    if _numeric_signal_count(uk_line) < 1 or _numeric_signal_count(us_line) < 1:
-        return None
-
-    ans = (
-        "Current inflation snapshot (UK vs US):\n"
-        f"- UK: {uk_line}\n"
-        f"- US: {us_line}"
-    )
-    src = [uk_src.get("link", ""), us_src.get("link", "")]
-    src = [u for u in src if normalize(u)]
-    if src:
-        ans += "\n\nSources:\n" + "\n".join(f"- {u}" for u in src[:3])
-    return ans, src[:3], "web_inflation_official"
-
-
-def _try_stock_answer(query: str, max_items: int = 5, timeout: int = 15) -> Optional[Tuple[str, List[str], str]]:
-    if not _has_stock_intent(query):
-        return None
-    symbols = _extract_stock_symbols(query)
-    if not symbols:
-        return None
-
-    rows: List[Dict[str, float | str]] = []
-    for s in symbols[:3]:
-        r = _fetch_stooq_daily(s, timeout=min(timeout, 12))
-        if r is not None:
-            rows.append(r)
-    if not rows:
-        return None
-
-    lines: List[str] = []
-    for r in rows:
-        sym = str(r["symbol"])
-        d = str(r["date"])
-        c = float(r["close"])
-        p = float(r["change_pct"])
-        sign = "+" if p >= 0 else ""
-        lines.append(f"- {sym} ({d}): close {c:.2f}, 1-day change {sign}{p:.2f}%")
-
-    src = ["https://stooq.com/"]
-
-    # add one short current-news layer for the first symbol
-    news_q = f"{rows[0]['symbol']} stock latest news"
-    news_items = _search_google_news(news_q, max_items=max(1, min(2, max_items)), timeout=timeout)
-    if news_items:
-        lines.append(f"- News: {_clean_news_title(news_items[0].get('title', ''))}.")
-        for it in news_items[:2]:
-            u = normalize(it.get("source_url", "")) or normalize(it.get("link", ""))
-            if u:
-                src.append(u)
-
-    ans = "Latest stock snapshot:\n" + "\n".join(lines)
-    src = [u for i, u in enumerate(src) if u and u not in src[:i]]
-    ans += "\n\nSources:\n" + "\n".join(f"- {u}" for u in src[:3])
-    return ans, src[:3], "web_stock_official"
-
-
-def _search_spacex_recent_launches_ll2(max_items: int = 5, timeout: int = 15) -> List[Dict[str, str]]:
-    # Launch Library 2 is usually fresher than some mirrors and includes outcome status.
-    now = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
-    q = urllib.parse.urlencode(
-        {
-            "search": "SpaceX",
-            "net__lte": now,
-            "ordering": "-net",
-            "limit": str(max(1, int(max_items))),
-        }
-    )
-    url = f"https://ll.thespacedevs.com/2.2.0/launch/?{q}"
-    txt = _fetch_text(url, timeout=timeout)
-    if not txt:
-        return []
-    try:
-        data = json.loads(txt)
-        results = data.get("results", []) if isinstance(data, dict) else []
-    except Exception:
-        return []
-    if not isinstance(results, list):
-        return []
-
-    out: List[Dict[str, str]] = []
-    for r in results:
-        if not isinstance(r, dict):
-            continue
-        name = normalize(str(r.get("name", "")))
-        if not name:
-            continue
-        net = normalize(str(r.get("net", "")))
-        status = r.get("status", {}) if isinstance(r.get("status", {}), dict) else {}
-        outcome = normalize(str(status.get("abbrev", ""))).lower()
-        if not outcome:
-            outcome = normalize(str(status.get("name", "unknown"))).lower()
-        mission = r.get("mission", {}) if isinstance(r.get("mission", {}), dict) else {}
-        detail = normalize(str(mission.get("description", "")))
-        src = normalize(str(r.get("url", ""))) or "https://thespacedevs.com/launches/"
-        out.append(
-            {
-                "title": name,
-                "link": src,
-                "pub_date": net,
-                "snippet": detail,
-                "outcome": outcome,
-            }
-        )
-    return out
-
-
-def _search_spacex_recent_launches(max_items: int = 5, timeout: int = 15) -> List[Dict[str, str]]:
-    payload: Dict[str, object] = {
-        "query": {"upcoming": False},
-        "options": {
-            "sort": {"date_unix": "desc"},
-            "limit": int(max(1, max_items)),
-            "select": ["name", "date_utc", "date_unix", "success", "details", "links"],
-        },
-    }
-    res = _post_json("https://api.spacexdata.com/v5/launches/query", payload, timeout=timeout)
-    docs = res.get("docs", []) if isinstance(res, dict) else []
-    if not isinstance(docs, list):
-        return []
-
-    out: List[Dict[str, str]] = []
-    for d in docs:
-        if not isinstance(d, dict):
-            continue
-        name = normalize(str(d.get("name", "")))
-        date_utc = normalize(str(d.get("date_utc", "")))
-        if not date_utc and d.get("date_unix") is not None:
-            try:
-                date_utc = datetime.fromtimestamp(float(d.get("date_unix")), tz=timezone.utc).isoformat()
-            except Exception:
-                date_utc = ""
-        success_raw = d.get("success", None)
-        if success_raw is True:
-            outcome = "success"
-        elif success_raw is False:
-            outcome = "failed"
-        else:
-            outcome = "unknown"
-        details_obj = d.get("details", "")
-        details = normalize(details_obj) if isinstance(details_obj, str) else ""
-        links = d.get("links", {}) if isinstance(d.get("links", {}), dict) else {}
-        src = ""
-        if isinstance(links.get("wikipedia"), str):
-            src = normalize(str(links.get("wikipedia", "")))
-        if not src and isinstance(links.get("webcast"), str):
-            src = normalize(str(links.get("webcast", "")))
-        if not src:
-            src = "https://www.spacex.com/launches/"
-        if not name:
-            continue
-        out.append(
-            {
-                "title": name,
-                "link": src,
-                "pub_date": date_utc,
-                "snippet": details,
-                "outcome": outcome,
-            }
-        )
-    # Guard against stale mirror/API data; fallback to broader web search if outdated.
-    if out:
-        try:
-            newest = out[0].get("pub_date", "")
-            newest_dt = datetime.fromisoformat(str(newest).replace("Z", "+00:00"))
-            age_days = (datetime.now(timezone.utc) - newest_dt).days
-            if age_days > 400:
-                return _search_spacex_recent_launches_ll2(max_items=max_items, timeout=timeout)
-        except Exception:
-            pass
-    if out:
-        return out
-    return _search_spacex_recent_launches_ll2(max_items=max_items, timeout=timeout)
-
-
-def _format_spacex_launches_answer(items: List[Dict[str, str]]) -> str:
-    if not items:
-        return _web_no_result_answer("spacex recent launches")
-    lines: List[str] = []
-    for it in items[:3]:
-        dt = normalize(it.get("pub_date", ""))
-        try:
-            d = datetime.fromisoformat(dt.replace("Z", "+00:00")).date().isoformat() if dt else "unknown-date"
-        except Exception:
-            d = dt[:10] if len(dt) >= 10 else "unknown-date"
-        name = normalize(it.get("title", ""))
-        outcome = normalize(it.get("outcome", "unknown")) or "unknown"
-        detail = normalize(it.get("snippet", ""))
-        if detail:
-            detail = _two_sentence_text(detail)
-            lines.append(f"- {d} | {name} | outcome: {outcome} | note: {detail}")
-        else:
-            lines.append(f"- {d} | {name} | outcome: {outcome}")
-    src = "\n".join(f"- {it['link']}" for it in items[:3] if it.get("link"))
-    return "Most recent SpaceX launches and outcomes:\n" + "\n".join(lines) + f"\n\nSources:\n{src}"
-
-
 def _latest_news_quality(query: str, items: List[Dict[str, str]]) -> int:
     if not items:
         return -999
@@ -1239,9 +1140,14 @@ def _latest_news_quality(query: str, items: List[Dict[str, str]]) -> int:
 
 def _clean_snippet(snippet: str, max_chars: int = 220) -> str:
     s = normalize(snippet)
+    s = s.replace("|", " ")
+    s = re.sub(r"\[\d+\]", " ", s)
+    s = re.sub(r"\s*\|\s*[^|]{0,60}$", "", s)
+    s = re.sub(r"\s+-\s+[^-]{0,60}$", "", s)
+    s = re.sub(r"\s+", " ", s).strip()
     s = re.sub(r"\s+", " ", s).strip()
     if len(s) > max_chars:
-        s = s[: max_chars - 1].rstrip() + "…"
+        s = s[: max_chars - 3].rstrip() + "..."
     return s
 
 
@@ -1249,84 +1155,146 @@ def _numeric_signal_count(text: str) -> int:
     return len(re.findall(r"\b\d+(?:\.\d+)?\b", text))
 
 
+def _query_asks_numeric_fact(query: str) -> bool:
+    ql = normalize(query).lower()
+    return bool(
+        re.search(r"\b(how many|how much|quanto|quanti|quanta)\b", ql)
+        or re.search(r"\bwhat is\b.*\bof\b", ql)
+        or ("vram" in ql)
+        or ("memory" in ql)
+        or ("ram" in ql)
+    )
+
+
+def _extract_factoid_answer(query: str, items: List[Dict[str, str]]) -> Optional[str]:
+    q = normalize(query)
+    if not items:
+        return None
+
+    corpus: List[str] = []
+    for it in items[:4]:
+        corpus.append(normalize(it.get("snippet", "")))
+        corpus.append(normalize(it.get("title", "")))
+    corpus = [c for c in corpus if c]
+    if not corpus:
+        return None
+
+    # Generic factoid: choose informative snippet with strongest topical overlap.
+    q_toks = _query_tokens(q)
+    query_nums = set(re.findall(r"\b\d+(?:\.\d+)?\b", q.lower()))
+    candidates: List[Tuple[int, int, int, int, str]] = []
+
+    def add_candidate_text(txt: str) -> None:
+        for s in _split_sentences(txt):
+            s = normalize(s)
+            if len(s) < 12:
+                continue
+            low_s = s.lower()
+            overlap = sum(1 for t in q_toks if t in low_s)
+            if overlap <= 0:
+                continue
+            nums = re.findall(r"\b\d+(?:\.\d+)?\b", low_s)
+            numeric = len(nums)
+            novel_numeric = sum(1 for n in nums if n not in query_nums)
+            score = overlap * 4 + min(4, numeric * 2) + min(6, novel_numeric * 3)
+            if "|" in s:
+                score -= 3
+            if re.search(r"\[\d+\]", s):
+                score -= 2
+            if re.search(r"\b(toggle|subsection|contents?)\b", low_s):
+                score -= 4
+            if re.search(r"\b\d+\.\d+\b", low_s):
+                score -= 2
+            has_predicate = any(v in low_s for v in (" is ", " are ", " was ", " were ", " has ", " have ", " include", " includes ", " e ", " sono ", " ha "))
+            if (not has_predicate) and numeric == 0:
+                score -= 2
+            candidates.append((score, novel_numeric, numeric, len(s), s))
+
+    for c in corpus:
+        add_candidate_text(c)
+        low_c = c.lower()
+        for tok in q_toks[:8]:
+            start = 0
+            hits = 0
+            while hits < 3:
+                pos = low_c.find(tok, start)
+                if pos < 0:
+                    break
+                left = max(0, pos - 120)
+                right = min(len(c), pos + len(tok) + 120)
+                add_candidate_text(c[left:right])
+                start = pos + len(tok)
+                hits += 1
+    if not candidates:
+        return None
+
+    ask_numeric = _query_asks_numeric_fact(q)
+    if ask_numeric:
+        numeric_candidates = [c for c in candidates if c[2] > 0]
+        if numeric_candidates:
+            candidates = sorted(numeric_candidates, key=lambda x: (-x[1], -x[0], -x[2], x[3]))
+        else:
+            candidates = sorted(candidates, key=lambda x: (-x[0], -x[1], -x[2], x[3]))
+    else:
+        candidates = sorted(candidates, key=lambda x: (-x[0], -x[1], -x[2], x[3]))
+
+    def is_noisy_chunk(txt: str) -> bool:
+        low_txt = txt.lower()
+        if any(x in low_txt for x in ("---", ".jpg", ".png", ".svg", ".gif")):
+            return True
+        if any(x in low_txt for x in ("jump to content", "main menu", "privacy policy", "contact us", "sign in")):
+            return True
+        noise_ratio = sum(1 for ch in txt if ch in "-|[]{}") / max(1, len(txt))
+        return noise_ratio > 0.08
+
+    best = ""
+    for _, _, _, _, raw in candidates:
+        cleaned = _clean_snippet(raw, max_chars=180)
+        if cleaned and not is_noisy_chunk(cleaned):
+            best = cleaned
+            break
+    if not best:
+        return None
+    if best and best[-1] not in ".!?":
+        best += "."
+    return best or None
+
+
 def _intent_answer_quality_ok(query: str, answer: str) -> bool:
-    intent = _query_intent(query)
     low = normalize(answer).lower()
     if not low:
         return False
-    if intent == "specs":
-        return _numeric_signal_count(low) >= 2
-    if intent == "launches":
-        return ("outcome:" in low) or ("success" in low) or ("failed" in low)
-    if intent == "compare":
-        return ("compare" in low) or ("difference" in low) or ("another source" in low)
-    return True
+    # Generic quality: at least one topical token overlap or numeric signal for factoid questions.
+    q_toks = _query_tokens(query)
+    overlap = sum(1 for t in q_toks if t in low)
+    has_numeric = _numeric_signal_count(low) >= 1
+    if _query_asks_numeric_fact(query):
+        return has_numeric and overlap >= 1
+    if len(q_toks) >= 4:
+        return overlap >= 2 or (overlap >= 1 and has_numeric)
+    return overlap >= 1 or has_numeric
 
 
 def _format_general_web_answer(query: str, items: List[Dict[str, str]]) -> str:
     if not items:
         return "I couldn't find reliable web results for that query right now."
-    intent = _query_intent(query)
+    fact = _extract_factoid_answer(query, items)
+    if fact:
+        src = "\n".join(f"- {it['link']}" for it in items[:3] if it.get("link"))
+        return f"{fact}\n\nSources:\n{src}"
     lead = items[0]
     second = items[1] if len(items) > 1 else lead
     t1 = normalize(lead.get("title", ""))
     t2 = normalize(second.get("title", ""))
 
-    evidence = _collect_evidence_sentences(query, items, max_items=2)
-    if evidence:
-        e1 = _clean_snippet(evidence[0].get("evidence", ""), max_chars=320)
-        e2 = _clean_snippet((evidence[1].get("evidence", "") if len(evidence) > 1 else e1), max_chars=320)
-        s1, s2 = e1, e2
-        if evidence[0].get("title"):
-            t1 = evidence[0]["title"]
-        if len(evidence) > 1 and evidence[1].get("title"):
-            t2 = evidence[1]["title"]
-    else:
-        s1 = _clean_snippet(lead.get("snippet", "") or lead.get("title", ""))
-        s2 = _clean_snippet(second.get("snippet", "") or second.get("title", ""))
+    s1 = _clean_snippet(lead.get("snippet", "") or lead.get("title", ""))
+    s2 = _clean_snippet(second.get("snippet", "") or second.get("title", ""))
 
-    if intent == "specs":
-        resp = (
-            f"Current specs/features summary:\n"
-            f"- {t1}: {s1}\n"
-            f"- {t2}: {s2}"
-        )
-    elif intent == "compare":
-        resp = (
-            f"Comparison summary from current sources:\n"
-            f"- Source 1 ({t1}): {s1}\n"
-            f"- Source 2 ({t2}): {s2}"
-        )
-    elif intent == "launches":
-        resp = (
-            f"Recent launch/outcome information from web sources:\n"
-            f"- {t1}: {s1}\n"
-            f"- {t2}: {s2}"
-        )
-    elif intent == "travel":
-        resp = (
-            f"Current travel guidance:\n"
-            f"- {t1}: {s1}\n"
-            f"- {t2}: {s2}"
-        )
-    elif intent == "regulation":
-        resp = (
-            f"Recent regulatory update summary:\n"
-            f"- {t1}: {s1}\n"
-            f"- {t2}: {s2}"
-        )
-    elif intent == "economy":
-        resp = (
-            f"Recent market/economy summary:\n"
-            f"- {t1}: {s1}\n"
-            f"- {t2}: {s2}"
-        )
-    else:
-        resp = (
-            f"Web summary:\n"
-            f"- {t1}: {s1}\n"
-            f"- {t2}: {s2}"
-        )
+    resp = (
+        f"Web summary:\n"
+        f"- {t1}: {s1}\n"
+        f"- {t2}: {s2}"
+    )
     src = "\n".join(f"- {it['link']}" for it in items[:3] if it.get("link"))
     return f"{resp}\n\nSources:\n{src}"
 
@@ -1339,52 +1307,65 @@ def _web_no_result_answer(query: str) -> str:
 
 
 def _intent_retry_query(query: str) -> str:
-    intent = _query_intent(query)
-    suffix = {
-        "specs": "detailed technical specifications",
-        "compare": "technical comparison key differences",
-        "launches": "recent missions outcomes status",
-        "travel": "current official travel guide",
-        "regulation": "official update legal text",
-        "economy": "latest official data report",
-    }.get(intent, "reliable sources")
-    return f"{normalize(query)} {suffix}".strip()
+    return f"{normalize(query)} reliable primary sources".strip()
 
 
 def _try_general_web_answer(query: str, max_items: int = 5, timeout: int = 15) -> Optional[Tuple[str, List[str], str]]:
     q = normalize(query)
-    intent = _query_intent(q)
+    official_only = _official_only_requested(q)
 
-    # For direct comparison questions, encyclopedia-style references are usually cleaner than news snippets.
-    if intent == "compare":
-        cmp_ans = _try_compare_wikipedia(q, timeout=min(timeout, 12))
-        if cmp_ans is not None:
-            ans, src = cmp_ans
-            return ans, src, "web_compare_wikipedia"
-
-    if intent == "economy":
-        stock = _try_stock_answer(q, max_items=max_items, timeout=timeout)
-        if stock is not None:
-            return stock
-
-    if intent == "economy":
-        infl = _try_uk_us_inflation_answer(q, max_items=max_items, timeout=timeout)
-        if infl is not None:
-            return infl
-
-    # Intent-specific path for recent SpaceX launch outcomes.
-    if intent == "launches" and "spacex" in q.lower():
-        sx = _search_spacex_recent_launches(max_items=max_items, timeout=timeout)
-        if sx:
-            ans = _format_spacex_launches_answer(sx)
-            return ans, [it["link"] for it in sx[:3] if it.get("link")], "web_spacex"
-
-    ddg_items = _search_general_web(q, max_items=max_items, timeout=timeout)
+    base_items = _search_general_web(q, max_items=max_items, timeout=timeout)
+    ddg_items = list(base_items)
+    if official_only:
+        allowed = _allowed_official_domains(q)
+        ddg_items = [it for it in ddg_items if _is_allowed_official_domain(it.get("link", ""), allowed)]
+        if not ddg_items:
+            official_q = f"{q} official site documentation specs"
+            ddg_items = _search_general_web(official_q, max_items=max_items, timeout=timeout)
+            ddg_items = [it for it in ddg_items if _is_allowed_official_domain(it.get("link", ""), allowed)]
+        if not ddg_items:
+            seed_domains: List[str] = []
+            content_tokens = [
+                t for t in _query_tokens(q)
+                if t not in {"official", "sources", "source", "only", "use"}
+            ]
+            content_terms = " ".join(content_tokens[:6]) or q
+            for tok in _query_tokens(q):
+                if len(tok) < 4:
+                    continue
+                for tld in (".com", ".org", ".gov", ".edu"):
+                    seed_domains.append(tok + tld)
+            uniq_domains: List[str] = []
+            seen_domains = set()
+            for d in seed_domains:
+                if d in seen_domains:
+                    continue
+                seen_domains.add(d)
+                uniq_domains.append(d)
+            site_hits: List[Dict[str, str]] = []
+            for dom in uniq_domains[:6]:
+                site_q = f"site:{dom} {content_terms}"
+                for it in _search_general_web(site_q, max_items=max_items, timeout=timeout):
+                    if _domain_from_url(it.get("link", "")).endswith(dom):
+                        site_hits.append(it)
+            ddg_items = _rank_web_hits(q, site_hits, max_items=max_items)
+        elif len(ddg_items) < max(2, max_items // 2):
+            official_q = f"{q} official technical specifications"
+            extra = _search_general_web(official_q, max_items=max_items, timeout=timeout)
+            extra = [it for it in extra if _is_allowed_official_domain(it.get("link", ""), allowed)]
+            merged = ddg_items + extra
+            ddg_items = _rank_web_hits(q, merged, max_items=max_items)
     if ddg_items:
         ans = _format_general_web_answer(q, ddg_items)
         if (not _intent_answer_quality_ok(q, ans)) or _looks_generic_or_bad_answer(ans):
             retry_q = _intent_retry_query(q)
-            retry_items = _search_general_web(retry_q, max_items=max_items, timeout=timeout)
+            if official_only:
+                retry_q = f"{q} official technical specifications detailed"
+                allowed = _allowed_official_domains(q)
+                retry_items = _search_general_web(retry_q, max_items=max_items, timeout=timeout)
+                retry_items = [it for it in retry_items if _is_allowed_official_domain(it.get("link", ""), allowed)]
+            else:
+                retry_items = _search_general_web(retry_q, max_items=max_items, timeout=timeout)
             if retry_items:
                 retry_ans = _format_general_web_answer(q, retry_items)
                 if _intent_answer_quality_ok(q, retry_ans) and (not _looks_generic_or_bad_answer(retry_ans)):
@@ -1396,16 +1377,32 @@ def _try_general_web_answer(query: str, max_items: int = 5, timeout: int = 15) -
         _search_wikipedia_pages(q, max_items=max_items, timeout=min(timeout, 12)),
         max_items=max_items,
     )
+    if official_only:
+        wiki_items = []
     if wiki_items:
         ans = _format_general_web_answer(q, wiki_items)
         if _intent_answer_quality_ok(q, ans) and (not _looks_generic_or_bad_answer(ans)):
             return ans, [it["link"] for it in wiki_items[:3] if it.get("link")], "web_wikipedia_search"
 
-    if _allow_news_fallback(intent):
+    if (not official_only) and _allow_news_fallback("general"):
         news_items = _search_google_news(q, max_items=max_items, timeout=timeout)
         if news_items:
             ans = _format_latest_answer(q, news_items)
             return ans, [it["link"] for it in news_items[:3] if it.get("link")], "web_general_news_fallback"
+
+    if official_only:
+        fallback_items = list(base_items)
+        return (
+            (
+                "I couldn't verify enough official sources for that query right now. "
+                "Using the best available sources instead.\n\n"
+                + _format_general_web_answer(q, fallback_items)
+            )
+            if fallback_items
+            else "I couldn't find enough official sources for that query right now.",
+            [it["link"] for it in fallback_items[:3] if it.get("link")] if fallback_items else [],
+            "web_official_relaxed" if fallback_items else "web_official_no_results",
+        )
 
     return None
 
@@ -1418,120 +1415,19 @@ def _needs_general_web_search(user: str) -> bool:
         return False
     if "answer with a number only" in low or "reply yes or no only" in low:
         return False
-    if _prefer_general_web(low):
+    if _needs_latest_web_search(low):
         return True
-    hints = [
-        "latest",
-        "recent",
-        "current",
-        "developments",
-        "breakthrough",
-        "compare",
-        "key features",
-        "top ",
-        "best ",
-        "stock",
-        "inflation",
-        "market",
-        "regulation",
-        "launch",
-        "specs",
-        "tourist attractions",
-        "travel tips",
-        "ces",
-    ]
-    if any(h in low for h in hints):
-        return True
-    # fallback: explicit question with topical nouns
-    return ("?" in low) and len(_query_tokens(low)) >= 3
+    return ("?" in low) and len(_query_tokens(low)) >= 2
 
 
 def _ddg_query_variants(query: str) -> List[str]:
     q = normalize(query)
-    low = q.lower()
-    out = [q]
-    intent = _query_intent(q)
-
-    if intent == "specs" and "nvidia" in low and "gpu" in low:
-        out += [
-            "NVIDIA GeForce RTX 50 series specifications",
-            "NVIDIA latest GeForce RTX specs CUDA memory bandwidth",
-        ]
-    if intent == "compare" and "ada" in low and "blackwell" in low:
-        out += [
-            "NVIDIA Ada Lovelace vs Blackwell architecture differences",
-            "Blackwell compared with Ada Lovelace performance features",
-        ]
-    if intent == "specs" and "intel" in low and "cpu" in low:
-        out += [
-            "Intel latest Core Ultra CPUs key features",
-            "Intel newest CPU lineup specifications",
-        ]
-    if intent == "launches" and "spacex" in low:
-        out += [
-            "latest SpaceX launches and mission outcomes",
-            "SpaceX recent missions results",
-        ]
-    if intent == "travel" and "tokyo" in low:
-        out += [
-            "Tokyo travel tips 2026",
-            "best things to do in Tokyo this year",
-        ]
-    if intent == "travel" and "london" in low:
-        out += [
-            "top tourist attractions in London 2026",
-            "best places to visit in London this year",
-        ]
-    if intent == "regulation" and "ai" in low and ("eu" in low or "europe" in low):
-        out += [
-            "EU AI Act latest developments",
-            "European Union AI regulation updates 2026",
-        ]
-    if intent == "economy" and "inflation" in low:
-        out += [
-            "current inflation UK US trend",
-            "latest inflation data UK and US",
-        ]
-    if intent == "economy" and ("nvda" in low or "nvidia" in low) and "stock" in low:
-        out += [
-            "NVDA stock latest performance and news",
-            "NVIDIA stock price recent performance",
-        ]
-
-    seen = set()
-    uniq: List[str] = []
-    for x in out:
-        k = x.lower()
-        if k in seen:
-            continue
-        seen.add(k)
-        uniq.append(x)
-    return uniq
+    return [q] if q else []
 
 
 def _latest_query_variants(query: str) -> List[str]:
     q = normalize(query)
-    low = q.lower()
-    out = [q]
-    if "nvidia" in low and "gpu" in low:
-        out += [
-            "NVIDIA latest GeForce RTX GPUs launch",
-            "NVIDIA new GeForce RTX announcement",
-        ]
-    elif "nvidia" in low and ("latest" in low or "ultime" in low):
-        out += [
-            "NVIDIA latest GeForce RTX launch",
-        ]
-    # preserve order but dedupe
-    seen = set()
-    uniq = []
-    for x in out:
-        k = x.lower()
-        if k in seen:
-            continue
-        seen.add(k)
-        uniq.append(x)
-    return uniq
+    return [q] if q else []
 
 
 def _parse_pub_ts(pub_date: str) -> float:
@@ -1543,21 +1439,12 @@ def _parse_pub_ts(pub_date: str) -> float:
 
 def _latest_title_score(title: str, query: str) -> int:
     t = title.lower()
-    q = query.lower()
-    score = 0
-    pos = ["nvidia", "gpu", "geforce", "rtx", "launch", "announc", "series", "blackwell"]
-    neg = ["how-to", "guide", "review", "investigating", "fps", "glitches", "opinion"]
-    for k in pos:
-        if k in t:
-            score += 2
-    for k in neg:
-        if k in t:
-            score -= 2
-    if "gpu" in q and ("rtx" in t or "geforce" in t):
-        score += 3
-    if "latest" in q or "ultim" in q:
-        if "launch" in t or "announc" in t or "new" in t:
-            score += 2
+    q_toks = _query_tokens(query)
+    score = sum(2 for tok in q_toks if tok in t)
+    if any(k in t for k in ("latest", "new", "update", "announc", "launch", "release")):
+        score += 2
+    if any(k in t for k in ("opinion", "rumor", "forum")):
+        score -= 1
     return score
 
 
@@ -1611,18 +1498,12 @@ def _format_latest_answer(query: str, items: List[Dict[str, str]]) -> str:
     if not items:
         return "I couldn't find recent sources for that query right now."
     lead = items[0]
-    second = items[1] if len(items) > 1 else items[0]
-    t1 = _clean_news_title(lead.get("title", "")).rstrip(".")
-    t2 = _clean_news_title(second.get("title", "")).rstrip(".")
-    s1 = _clean_snippet(lead.get("snippet", "") or t1, max_chars=220)
-    s2 = _clean_snippet(second.get("snippet", "") or t2, max_chars=220)
-    src1 = normalize(lead.get("source_name", ""))
-    src2 = normalize(second.get("source_name", ""))
-    if src1:
-        s1 = f"{s1} ({src1})"
-    if src2:
-        s2 = f"{s2} ({src2})"
-    resp = f"Recent coverage says: {t1}. Key point: {s1}. Another report says: {t2}. Key point: {s2}."
+    title = _clean_news_title(lead.get("title", "")).rstrip(".")
+    snip = _clean_snippet(lead.get("snippet", "") or title, max_chars=180)
+    resp = f"Latest reported update: {title}."
+    if snip and snip.lower() not in title.lower():
+        resp += f" {snip}"
+
     links = []
     for it in items[:3]:
         candidate = normalize(it.get("source_url", "")) or normalize(it.get("link", ""))
@@ -1664,7 +1545,13 @@ def _append_turn_log(
 
 def _looks_like_math_query(user: str) -> bool:
     u = (user or "").lower()
-    return bool(re.search(r"\d+\s*[+\-*/]\s*\d+", u))
+    if re.search(r"\d+\s*[+\-*/]\s*\d+", u):
+        return True
+    if re.search(r"(-?\d+(?:\.\d+)?)\s*(?:greater than|larger than|bigger than|less than|smaller than|minore di|maggiore di)\s*(-?\d+(?:\.\d+)?)", u):
+        return True
+    if re.search(r"-?\d+(?:\.\d+)?\s*[<>]\s*-?\d+(?:\.\d+)?", u):
+        return True
+    return False
 
 
 def _looks_like_factual_query(user: str) -> bool:
@@ -1712,6 +1599,8 @@ def _should_confidence_web_fallback(
 ) -> bool:
     if not _looks_like_factual_query(user):
         return False
+    if len((ans or "").strip()) < 18:
+        return True
     if _looks_generic_or_bad_answer(ans):
         return True
     return avg_token_prob < threshold
@@ -1978,8 +1867,8 @@ def main():
     ap.add_argument("--temperature", type=float, default=DEFAULT_TEMPERATURE)
     ap.add_argument("--top_p", type=float, default=DEFAULT_TOP_P)
     ap.add_argument("--no_web", action="store_true", help="Disable URL/latest web routing")
-    ap.add_argument("--web_timeout", type=int, default=15)
-    ap.add_argument("--web_results", type=int, default=5)
+    ap.add_argument("--web_timeout", type=int, default=20)
+    ap.add_argument("--web_results", type=int, default=6)
     ap.add_argument("--web_log", default="data/web_chat_log.jsonl")
     ap.add_argument(
         "--turn_log",
@@ -1994,7 +1883,7 @@ def main():
     ap.add_argument(
         "--confidence_threshold",
         type=float,
-        default=0.18,
+        default=0.22,
         help="Fallback to web when avg token confidence is below this threshold",
     )
     args = ap.parse_args()
@@ -2035,14 +1924,17 @@ def main():
         if user.lower() in ("/exit", "/quit"):
             break
 
+        format_spec = _detect_format_spec(user)
+        strict_format = _has_strict_format(format_spec)
+
         if not args.no_web:
             url = _find_first_url(user)
-            if url:
+            if url and (not strict_format or _is_summary_request(user)):
                 article = _fetch_article_text(url, timeout=args.web_timeout)
                 if article:
-                    summ = _summarize_plain_text(article, bullets=False)
+                    summ = _summarize_plain_text(article, bullets=bool(format_spec.get("two_bullets")))
                     if summ:
-                        ans = f"{summ}\n\nSource:\n- {url}"
+                        ans = summ if strict_format else f"{summ}\n\nSource:\n- {url}"
                         print(f"Bot: {ans}\n")
                         _append_turn_log(
                             args.turn_log,
@@ -2063,7 +1955,10 @@ def main():
                         )
                         continue
 
-            if _needs_latest_web_search(user) and not _prefer_general_web(user):
+            if strict_format:
+                # Skip web routing for strict-format requests to avoid source blocks.
+                pass
+            elif _needs_latest_web_search(user) and not _prefer_general_web(user):
                 items = _search_google_news(user, max_items=max(1, args.web_results), timeout=args.web_timeout)
                 q_score = _latest_news_quality(user, items)
                 if q_score < 3:
@@ -2140,7 +2035,10 @@ def main():
                 )
                 continue
 
-            if _needs_general_web_search(user):
+            if strict_format:
+                # Skip web routing for strict-format requests to avoid source blocks.
+                pass
+            elif _needs_general_web_search(user):
                 web_try = _try_general_web_answer(
                     user,
                     max_items=max(1, args.web_results),
@@ -2220,9 +2118,13 @@ def main():
             args.top_p,
             return_meta=True,
         )
+        raw_ans = ans
         avg_prob = float(meta.get("avg_token_prob", 0.0))
+        repaired_ans, repair_mode = _apply_format_repair(user, ans)
+        if repair_mode:
+            ans = repaired_ans
 
-        if (not args.no_web) and (not args.no_confidence_web):
+        if (not args.no_web) and (not args.no_confidence_web) and (not strict_format):
             if _should_confidence_web_fallback(user, ans, avg_prob, float(args.confidence_threshold)):
                 entity_ans = _try_entity_answer(user, timeout=args.web_timeout)
                 if entity_ans is not None:
@@ -2352,8 +2254,12 @@ def main():
             args.turn_log,
             user=user,
             answer=ans,
-            mode="model",
-            meta={"model_avg_token_prob": round(avg_prob, 4)},
+            mode="model_repair" if repair_mode else "model",
+            meta={
+                "model_avg_token_prob": round(avg_prob, 4),
+                "repair_mode": repair_mode,
+                "model_answer": normalize(raw_ans) if repair_mode else None,
+            },
         )
 
 

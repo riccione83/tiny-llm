@@ -1,19 +1,33 @@
 # Large training data files
 data/sources_v5/
 data/
+finetuning/
+finetuning_v2/
+finetuning_v3_safe/
 
-old/
+# Legacy local-training workspace (keep scripts, ignore heavy artifacts)
+tiny-llm/data/
+tiny-llm/feedback/
+tiny-llm/finetuning/
+tiny-llm/checkpoints_chat_v1/
+tiny-llm/training_chat_v1.csv
+tiny-llm/pretokenized_corpus.npy
+tiny-llm/fast_gpt_v3_best.pt
+tiny-llm/llm_tokenizer.model
+tiny-llm/llm_tokenizer.vocab
+
 rag_cache/
 # Model checkpoints (large files)
 checkpoints_v3/
+checkpoints_v2/
 *.pt
 *.npy
 
 feedback/
 
 # Keep tokenizer files (small, needed for code to work)
-!llm_tokenizer.model
-!llm_tokenizer.vocab
+!/llm_tokenizer.model
+!/llm_tokenizer.vocab
 
 # Python cache
 __pycache__/

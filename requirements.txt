@@ -3,3 +3,8 @@ numpy
 sentencepiece
 tqdm
 torch
+transformers
+sentence-transformers
+accelerate
+beautifulsoup4
+safetensors
