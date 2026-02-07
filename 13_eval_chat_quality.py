@@ -16,7 +16,7 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     # New args
     ap.add_argument("--backend", default="hf", choices=["hf", "tiny"])
-    ap.add_argument("--model_name", default="Qwen/Qwen2.5-1.5B-Instruct")
+    ap.add_argument("--model_name", default="Qwen/Qwen3-4B-Instruct-2507")
     ap.add_argument("--embedding_model", default="sentence-transformers/all-MiniLM-L6-v2")
     ap.add_argument("--tiny_ckpt", default="checkpoints_v2/final.pt")
     ap.add_argument("--tiny_tokenizer", default="tokenizer.model")

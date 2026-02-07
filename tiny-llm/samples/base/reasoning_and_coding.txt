@@ -1,0 +1,76 @@
+Reasoning, writing, and coding fundamentals
+
+Good reasoning separates facts, assumptions, and conclusions. Facts are
+verifiable statements. Assumptions are uncertain inputs. Conclusions are what
+follows if assumptions hold. Confusing these categories leads to fragile plans.
+
+When solving problems, define the objective in one sentence. Then define what
+"done" means with measurable criteria. Without a clear success metric, teams
+optimize for activity instead of results.
+
+Complex projects benefit from decomposition:
+1. Break into independent modules.
+2. Define interfaces early.
+3. Integrate frequently.
+4. Keep a rollback path.
+5. Measure behavior after each integration.
+
+In software, readability is a performance feature for teams. Clear names,
+small functions, and explicit error handling reduce defects and review time.
+Premature abstraction creates accidental complexity.
+
+Common code review checks:
+1. Correctness: does logic match requirements?
+2. Safety: what happens on bad input or timeout?
+3. Maintainability: can another engineer change this quickly?
+4. Performance: any obvious bottleneck or unnecessary allocation?
+5. Observability: can failures be diagnosed from logs and metrics?
+
+Testing strategy:
+- Unit tests for local logic and edge cases.
+- Integration tests for boundaries and external dependencies.
+- End-to-end smoke tests for user-visible critical flows.
+- Regression tests for known historical failures.
+
+For language model training pipelines, reproducibility matters:
+- Save exact hyperparameters.
+- Save tokenizer and config.
+- Save checkpoints with global step.
+- Record data recipe and source names.
+- Fix random seed when comparing experiments.
+
+A practical evaluation loop for assistants:
+1. Build a stable benchmark set.
+2. Score factuality, instruction-following, and format compliance.
+3. Track failure modes with examples.
+4. Adjust data mix and rerun.
+5. Stop when gains flatten or regressions appear.
+
+Prompt design basics:
+- Put core instruction first.
+- Add concise constraints.
+- Request explicit output format.
+- Provide one or two examples if needed.
+- Keep irrelevant context out.
+
+For robust answers, the model should:
+- state uncertainty when needed,
+- avoid fabricated citations,
+- ask clarifying questions when ambiguous,
+- and keep responses aligned with user constraints.
+
+Short writing style guide:
+- Prefer concrete language.
+- Use active voice.
+- Avoid filler words.
+- Keep each paragraph to one idea.
+- End with an actionable next step when appropriate.
+
+Ethical and safe behavior in assistants:
+- Do not invent legal, medical, or financial certainty.
+- Encourage verification for high-stakes decisions.
+- Decline clearly unsafe requests.
+- Preserve user privacy by default.
+
+The most useful systems are not only accurate in ideal settings; they are
+predictable under stress, transparent in failure, and easy to improve.

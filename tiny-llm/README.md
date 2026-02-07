@@ -1,211 +1,120 @@
-﻿# Tiny LLM Chat Pipeline
+# tiny-llm (Modern Minimal Pipeline)
 
-Small GPT-style model (~184M params) focused on chat-first behavior on a single GPU (Windows).
+This folder now uses a strict 4-script workflow:
 
-This folder is the local end-to-end training path for this repository.
+1. `01_download_base.py`
+2. `02_train_base.py`
+3. `03_download_lora_base.py`
+4. `04_train_lora.py`
 
-## Quick Start
+Goal: a modern, maintainable pipeline that can run for days and scale quality with bigger data.
 
-Run the menu:
+Included local samples:
+- Base training: `samples/base/*.txt` and `samples/base/*.jsonl`
+- LoRA training: `samples/sft/*.jsonl`
 
-```
-python .\00_start.py
-```
+These are already loaded by default by `02_train_base.py` and `04_train_lora.py`.
 
-## Main Steps (v1)
+## Install
 
-1) Build chat corpus + tokenize
-
-```
-python .\01_make_chat_corpus_and_tokenize.py
-```
-
-Outputs:
-- data\chat_corpus_v1.txt
-- data\chat_corpus_v1_tokens.npy
-
-2) Train base chat model
-
-```
-python .\02_train_base_chat.py
+```powershell
+python -m pip install -U pip
+python -m pip install -r ..\requirements.txt
 ```
 
-Outputs:
-- checkpoints_chat_v1\*.pt
-- training_chat_v1.csv
+## 1) Download Base Model (full-training path)
 
-3) Build instruction dataset (JSON)
-
-```
-python .\03_create_instruct.py
+```powershell
+cd tiny-llm
+python .\01_download_base.py --model_id Qwen/Qwen2.5-0.5B-Instruct --output_dir models/base
 ```
 
-Output:
-- data\instruct_v4.json
+Notes:
+- `0.5B` is a practical default for full fine-tuning.
+- Change `--model_id` if you have more VRAM.
 
-4) Small synthetic chat set
+## 2) Train Base Model (knowledge-first)
 
-```
-python .\04_make_synthetic_chat.py
-```
-
-5) Large synthetic SFT set
-
-```
-python .\05_make_synth_chat_sft.py
+```powershell
+python .\02_train_base.py --model_dir models/base --output_dir models/base_trained --recipe knowledge-heavy --max_steps 30000 --repeat_sources --gradient_checkpointing
 ```
 
-6) Build feedback dataset (auto-generated)
+What this script does:
+- Streams large corpora (FineWeb-EDU + C4 + FineWeb, recipe dependent).
+- Packs tokens into fixed blocks for efficient causal LM training.
+- Supports long multi-day runs using `--max_steps`.
+- Saves periodic checkpoints every `--save_steps`.
+- On `Ctrl+C`, saves an emergency checkpoint before exit.
+- Includes local curated samples by default.
 
-```
-python .\06_make_feedback_sft.py
-```
+Useful options:
+- `--recipe tiny|standard|knowledge-heavy`
+- `--max_steps 100000` for long training
+- `--hf_source "dataset|config|split|text_field|max_texts"` to add more sources
+- `--disable_hf_data` to train only on local samples/custom files
+- `--resume_from_checkpoint <path>`
 
-7) LoRA fine-tune + chat
+Resume example:
 
-```
-python .\07_lora_and_chat.py --mode lora
-python .\07_lora_and_chat.py --mode chat --use_lora
-```
-
-Outputs:
-- finetuning\lora_adapter.pt
-- finetuning\lora_full_state.pt
-
-## Recommended End-to-End Sequence (v1)
-
-Use this order from scratch:
-
-1) Build chat corpus + tokenize
-
-```
-python .\01_make_chat_corpus_and_tokenize.py
+```powershell
+python .\02_train_base.py --model_dir models/base --output_dir models/base_trained --resume_from_checkpoint models/base_trained/checkpoint-1500
 ```
 
-2) Train base chat model
+## 3) Download LoRA Base (alignment path)
 
-```
-python .\02_train_base_chat.py
-```
-
-3) Build instruction dataset
-
-```
-python .\03_create_instruct.py
+```powershell
+python .\03_download_lora_base.py --model_id Qwen/Qwen3-4B-Instruct-2507 --output_dir models/lora_base
 ```
 
-4) Build small synthetic chat set (optional)
+Why separate:
+- For best chat quality, LoRA often benefits from a stronger instruct base than full-training default.
 
-```
-python .\04_make_synthetic_chat.py
-```
+## 4) Train LoRA Adapter (instruction/chat)
 
-5) Build large synthetic SFT set
-
-```
-python .\05_make_synth_chat_sft.py
+```powershell
+python .\04_train_lora.py --model_dir models/lora_base --output_dir models/lora_adapter --recipe heavy --max_steps 8000 --repeat_sources --gradient_checkpointing --save_merged
 ```
 
-6) Build feedback dataset (auto-generated)
+What this script does:
+- Trains PEFT LoRA on instruction/chat datasets (UltraChat, OpenOrca, Alpaca, Dolly by recipe).
+- Uses completion-only labels (prompt tokens masked with `-100`).
+- Saves adapter and optional merged model.
+- Saves periodic checkpoints every `--save_steps`.
+- On `Ctrl+C`, saves an emergency checkpoint before exit.
+- Includes local curated SFT samples by default.
 
-```
-python .\06_make_feedback_sft.py
-```
+Useful options:
+- `--target_modules auto` (default) or manual comma list
+- `--lora_r`, `--lora_alpha`, `--lora_dropout`
+- `--hf_source "dataset|config|split|max_rows"` to add more SFT data
+- `--disable_hf_data` to train only on local SFT JSONL
+- `--resume_from_checkpoint <path>`
 
-7) LoRA on synthetic SFT set
+Resume example:
 
-```
-python .\07_lora_and_chat.py --mode synth_lora
-```
-
-8) LoRA on feedback data
-
-```
-python .\07_lora_and_chat.py --mode feedback_lora
-```
-
-9) Chat test
-
-```
-python .\07_lora_and_chat.py --mode chat --use_lora
+```powershell
+python .\04_train_lora.py --model_dir models/lora_base --output_dir models/lora_adapter --resume_from_checkpoint models/lora_adapter/checkpoint-900
 ```
 
-## RAG (Web Search) in Chat
+## Quick Smoke Runs (with built-in samples)
 
-Chat mode now uses web search + embeddings by default. To disable:
-
-```
-python .\07_lora_and_chat.py --mode chat --use_lora --rag_mode off
-```
-
-Helpful flags:
-
-- `--rag_mode auto|always|off` (default: auto)
-- `--rag_site wikipedia.org` (restrict to a site)
-- `--rag_debug` (print retrieved context)
-- `--rag_top_k 6` and `--rag_web_k 8` (depth)
-- `--rag_no_extract` (use model instead of extractive answer)
-
-Install dependencies:
-
-```
-pip install -U ddgs sentence-transformers requests beautifulsoup4
+```powershell
+python .\02_train_base.py --model_dir models/base --output_dir models/base_trained --disable_hf_data --max_steps 300 --save_steps 100 --gradient_checkpointing
+python .\04_train_lora.py --model_dir models/lora_base --output_dir models/lora_adapter --disable_hf_data --max_steps 400 --save_steps 100 --gradient_checkpointing
 ```
 
-RAG cache is stored in `rag_cache/`.
+## Quality Guidance
 
-## Synthetic Data Utilities
+- For stronger knowledge:
+  - prioritize `02_train_base.py` with `--recipe knowledge-heavy`
+  - run higher `--max_steps` (tens of thousands to hundreds of thousands)
+- For better instruction behavior:
+  - follow with `04_train_lora.py` on `--recipe standard` or `heavy`
+- For best results, monitor loss and periodically evaluate with a fixed benchmark set.
 
-Small chat set:
+## Output Layout
 
-```
-python .\04_make_synthetic_chat.py
-```
-
-Large SFT set (JSONL with instruction/output):
-
-```
-python .\05_make_synth_chat_sft.py
-```
-
-Large feedback set (JSONL with instruction/chosen):
-
-```
-python .\06_make_feedback_sft.py
-```
-
-## v2 Scripts (optional)
-
-Create larger instruction data:
-
-```
-python .\10_create_instruct_v2.py
-```
-
-Train a v2 base model:
-
-```
-python .\11_train_base_v2.py
-```
-
-## Notes
-
-- All scripts are resumable where possible.
-- LoRA uses the latest base checkpoint (prefers final.pt if present).
-- Large feedback and synth sets use streaming datasets to avoid RAM issues.
-
-## File Map
-
-- 00_start.py                Menu runner
-- 01_make_chat_corpus_and_tokenize.py
-- 02_train_base_chat.py
-- 03_create_instruct.py
-- 04_make_synthetic_chat.py
-- 05_make_synth_chat_sft.py
-- 06_make_feedback_sft.py
-- 07_lora_and_chat.py
-- 08_auto_feedback_1k.py
-- 09_clean_dataset.py
-- 10_create_instruct_v2.py
-- 11_train_base_v2.py
-
+- `models/base`              downloaded base for full training
+- `models/base_trained`      continued-pretrained model
+- `models/lora_base`         downloaded base for LoRA
+- `models/lora_adapter`      LoRA adapter (+ optional merged model)

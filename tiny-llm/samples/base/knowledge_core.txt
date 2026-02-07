@@ -1,0 +1,71 @@
+Scientific reasoning and practical knowledge
+
+The scientific method is a disciplined way to reduce error. A useful loop is:
+observe, propose a hypothesis, make a testable prediction, run a controlled
+test, and update the hypothesis based on evidence. Good scientific writing
+states assumptions, methods, limitations, and confidence level.
+
+Probability is not certainty. A forecast with 70 percent confidence means that
+if we repeated similar conditions many times, the event would occur around 70
+times out of 100. Good decisions combine probability, impact, and reversibility.
+
+Statistics answers "how likely is this pattern by chance?" A low p-value does
+not prove a claim. Effect size and data quality matter as much as significance.
+Biased sampling, leakage, and poor measurement can produce precise but wrong
+numbers.
+
+In machine learning, train and validation data must be separated. Leakage often
+happens when labels or future information enter input features. A model may look
+excellent in offline metrics and fail in production because real data drifted.
+
+Data quality basics:
+1. Define schema and units.
+2. Enforce required fields.
+3. Remove exact and near-duplicate records when needed.
+4. Track data source, version, and timestamp.
+5. Build simple sanity checks before large training runs.
+
+Computer systems are trade-offs. CPU focuses on low-latency general tasks. GPU
+focuses on high-throughput parallel math. Memory bandwidth and storage speed can
+be bottlenecks even when compute is available.
+
+For reliable software systems:
+1. Prefer clear interfaces over implicit coupling.
+2. Keep side effects explicit.
+3. Log structured events, not only plain text.
+4. Add health checks and timeout boundaries.
+5. Design for restart and partial failure.
+
+A practical debugging method:
+1. Reproduce the issue in the smallest possible setup.
+2. Add checkpoints to confirm assumptions.
+3. Change one variable at a time.
+4. Compare expected vs observed behavior with concrete evidence.
+5. Write a short postmortem and prevent recurrence.
+
+Security basics apply everywhere:
+- Validate and normalize inputs.
+- Use least privilege.
+- Avoid hardcoded secrets.
+- Rotate credentials and audit access.
+- Treat user data as sensitive by default.
+
+Networking essentials:
+- Latency is time per request.
+- Throughput is total work per unit time.
+- Retries improve resilience but can amplify load.
+- Backoff and jitter reduce synchronized spikes.
+- Caching helps when data is read frequently and updated rarely.
+
+Energy and climate knowledge:
+Power is instantaneous rate of energy use. Energy is accumulated power over
+time. Efficiency gains reduce cost, but rebound effects can increase total
+consumption if demand rises faster than efficiency.
+
+In communication, clarity beats complexity. A strong technical explanation
+includes goal, constraints, design choice, trade-off, and next action. Avoid
+claims without a measurable criterion.
+
+A high-quality engineering culture is evidence-driven. Teams should prefer
+small reproducible experiments, clear ownership, and post-release monitoring.
+Good process makes quality repeatable rather than accidental.

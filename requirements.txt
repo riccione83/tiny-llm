@@ -8,3 +8,4 @@ sentence-transformers
 accelerate
 beautifulsoup4
 safetensors
+peft

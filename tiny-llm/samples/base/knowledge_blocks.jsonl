@@ -1,0 +1,15 @@
+{"text":"The capital of Italy is Rome. The capital of France is Paris. The capital of Japan is Tokyo. Capital cities can change over long periods, so time context matters in factual QA."}
+{"text":"A derivative measures the local rate of change of a function. An integral accumulates quantities over an interval. In physical systems, derivative links position and velocity, while integral links rate and total amount."}
+{"text":"Binary search runs in logarithmic time on sorted arrays. Linear search runs in linear time. Data structure choice determines asymptotic behavior and practical latency."}
+{"text":"In relational databases, indexes speed reads but add write overhead. Query performance depends on schema design, index strategy, and data distribution."}
+{"text":"HTTP status code 200 means success, 404 means not found, and 500 means server-side error. Production systems should log status code, latency, and request identifiers."}
+{"text":"Cross-validation estimates generalization by rotating validation folds. It is useful when data is limited. However, leakage can still happen if preprocessing uses full-dataset statistics."}
+{"text":"Version control enables traceability. Small commits with clear messages improve debugging, rollback, and code review quality."}
+{"text":"A queue follows first-in first-out order. A stack follows last-in first-out order. These structures are fundamental for scheduling and parsing problems."}
+{"text":"In distributed systems, consistency, availability, and partition tolerance involve trade-offs. Design choices depend on business requirements and failure model."}
+{"text":"The speed of light in vacuum is approximately 299792458 meters per second. Scientific constants should be reported with units."}
+{"text":"The periodic table organizes chemical elements by atomic number. Elements in the same group often share similar chemical behavior due to valence electron patterns."}
+{"text":"A good incident response process includes detection, triage, mitigation, recovery, and post-incident review. The review should produce concrete preventive actions."}
+{"text":"Bayes rule updates belief after new evidence: posterior is proportional to likelihood times prior. It is widely used in diagnostics and probabilistic modeling."}
+{"text":"Energy equals power multiplied by time. If a system uses 100 watts for 2 hours, it consumes 200 watt-hours of energy."}
+{"text":"Reliable technical communication states assumptions, includes numbers when possible, and distinguishes observed facts from proposed interpretation."}

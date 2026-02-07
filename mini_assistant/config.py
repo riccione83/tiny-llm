@@ -4,7 +4,7 @@ from dataclasses import dataclass
 @dataclass
 class AssistantConfig:
     backend: str = "hf"  # "hf" | "tiny"
-    llm_model_name: str = "Qwen/Qwen2.5-1.5B-Instruct"
+    llm_model_name: str = "Qwen/Qwen3-4B-Instruct-2507"
     embedding_model_name: str = "sentence-transformers/all-MiniLM-L6-v2"
     tiny_ckpt: str = "checkpoints_v2/final.pt"
     tiny_tokenizer: str = "tokenizer.model"

@@ -10,7 +10,7 @@ Use `tiny-llm/` if you want to train everything locally from scratch.
 
 ## Path A (Recommended): Ready Model + Grounded QA
 
-- LLM: `Qwen/Qwen2.5-1.5B-Instruct`
+- LLM: `Qwen/Qwen3-4B-Instruct-2507`
 - Retriever embeddings: `sentence-transformers/all-MiniLM-L6-v2`
 - Runtime package: `mini_assistant/`
 - Optional local backend: your custom tiny checkpoint from `09_chat.py`
@@ -25,7 +25,7 @@ python -m pip install -r requirements.txt
 Run chat (search web automatically):
 
 ```powershell
-python -m mini_assistant.chat --backend hf --model_name Qwen/Qwen2.5-1.5B-Instruct --embedding_model sentence-transformers/all-MiniLM-L6-v2 --temperature 0.0
+python -m mini_assistant.chat --backend hf --model_name Qwen/Qwen3-4B-Instruct-2507 --embedding_model sentence-transformers/all-MiniLM-L6-v2 --temperature 0.0
 ```
 
 Show routing/debug (`direct` vs `web`):
@@ -40,55 +40,38 @@ Run chat on a fixed URL:
 python -m mini_assistant.chat --backend hf --url https://en.wikipedia.org/wiki/Italy
 ```
 
-Run chat with your ready local tiny checkpoint:
-
-```powershell
-python -m mini_assistant.chat --backend tiny --tiny_ckpt checkpoints_v2/final.pt --tiny_tokenizer tokenizer.model --tiny_lora finetuning_v2/lora_adapter.pt --tiny_top_p 1.0 --temperature 0.0 --embedding_model sentence-transformers/all-MiniLM-L6-v2
-```
-
 ## Path B: Local End-to-End Training (No External Base LLM)
 
-Training scripts are in `tiny-llm/`.
+Training is now a modern minimal 4-script pipeline in `tiny-llm/`:
 
 ```powershell
 cd tiny-llm
-python .\00_start.py
+python .\01_download_base.py --model_id Qwen/Qwen2.5-0.5B-Instruct --output_dir models/base
+python .\02_train_base.py --model_dir models/base --output_dir models/base_trained --recipe knowledge-heavy --max_steps 30000 --repeat_sources --gradient_checkpointing
+python .\03_download_lora_base.py --model_id Qwen/Qwen3-4B-Instruct-2507 --output_dir models/lora_base
+python .\04_train_lora.py --model_dir models/lora_base --output_dir models/lora_adapter --recipe heavy --max_steps 8000 --repeat_sources --gradient_checkpointing --save_merged
 ```
 
-Or run the explicit sequence:
-
-```powershell
-cd tiny-llm
-python .\01_make_chat_corpus_and_tokenize.py
-python .\02_train_base_chat.py
-python .\03_create_instruct.py
-python .\05_make_synth_chat_sft.py
-python .\06_make_feedback_sft.py
-python .\07_lora_and_chat.py --mode synth_lora
-python .\07_lora_and_chat.py --mode feedback_lora
-python .\07_lora_and_chat.py --mode chat --use_lora
-```
-
-Full details: `tiny-llm/README.md`.
+Full details and options: `tiny-llm/README.md`.
+Built-in local samples are in `tiny-llm/samples/` and are loaded by default in both training scripts.
 
 Run regression eval:
 
 ```powershell
-python 13_eval_chat_quality.py --backend hf --model_name Qwen/Qwen2.5-1.5B-Instruct --embedding_model sentence-transformers/all-MiniLM-L6-v2
+python 13_eval_chat_quality.py --backend hf --model_name Qwen/Qwen3-4B-Instruct-2507 --embedding_model sentence-transformers/all-MiniLM-L6-v2
 ```
 
 Run confidence-gate check:
 
 ```powershell
-python -m mini_assistant.eval_confidence_gate --backend hf --model_name Qwen/Qwen2.5-1.5B-Instruct --embedding_model sentence-transformers/all-MiniLM-L6-v2 --direct_confidence_threshold 0.72
-python -m mini_assistant.eval_confidence_gate --backend tiny --tiny_ckpt checkpoints_v2/final.pt --tiny_tokenizer tokenizer.model --tiny_lora finetuning_v2/lora_adapter.pt --embedding_model sentence-transformers/all-MiniLM-L6-v2 --direct_confidence_threshold 0.72
+python -m mini_assistant.eval_confidence_gate --backend hf --model_name Qwen/Qwen3-4B-Instruct-2507 --embedding_model sentence-transformers/all-MiniLM-L6-v2 --direct_confidence_threshold 0.72
 ```
 
 ## Notes
 
 - The new entrypoint for practical usage is `mini_assistant/chat.py`.
-- Best quality today is with `--backend hf` (`Qwen/Qwen2.5-1.5B-Instruct`).
-- `--backend tiny` works with your local checkpoint, but routing quality is lower than `hf`.
+- Best quality today is with `--backend hf` (`Qwen/Qwen3-4B-Instruct-2507`).
+- `--backend tiny` is legacy/optional and requires you to provide your own custom checkpoint artifacts.
 
 ## What To Ask
 

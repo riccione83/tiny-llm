@@ -15,6 +15,7 @@ tiny-llm/pretokenized_corpus.npy
 tiny-llm/fast_gpt_v3_best.pt
 tiny-llm/llm_tokenizer.model
 tiny-llm/llm_tokenizer.vocab
+tiny-llm/models/
 
 rag_cache/
 # Model checkpoints (large files)
@@ -64,4 +65,3 @@ desktop.ini
 # Planning documents
 SCALING_PLAN.md
 training_log.csv
-plan.txt

@@ -100,7 +100,7 @@ class LocalLLM:
     def __init__(
         self,
         backend: str = "hf",
-        model_name: str = "Qwen/Qwen2.5-1.5B-Instruct",
+        model_name: str = "Qwen/Qwen3-4B-Instruct-2507",
         max_new_tokens: int = 160,
         temperature: float = 0.0,
         tiny_ckpt: str = "checkpoints_v2/final.pt",
