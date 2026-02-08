@@ -46,6 +46,7 @@ What this script does:
 - Saves periodic checkpoints every `--save_steps`.
 - On `Ctrl+C`, saves an emergency checkpoint before exit.
 - Includes local curated samples by default.
+- Prints preview samples during training every `200` steps by default.
 
 Useful options:
 - `--recipe tiny|standard|knowledge-heavy`
@@ -53,6 +54,8 @@ Useful options:
 - `--hf_source "dataset|config|split|text_field|max_texts"` to add more sources
 - `--disable_hf_data` to train only on local samples/custom files
 - `--resume_from_checkpoint <path>`
+- `--sample_log_steps 200` and `--sample_log_count 2`
+- `--disable_sample_logging` to turn preview printing off
 
 Resume example:
 
@@ -82,6 +85,7 @@ What this script does:
 - Saves periodic checkpoints every `--save_steps`.
 - On `Ctrl+C`, saves an emergency checkpoint before exit.
 - Includes local curated SFT samples by default.
+- Prints preview prompt/answer samples during training every `200` steps by default.
 
 Useful options:
 - `--target_modules auto` (default) or manual comma list
@@ -89,6 +93,8 @@ Useful options:
 - `--hf_source "dataset|config|split|max_rows"` to add more SFT data
 - `--disable_hf_data` to train only on local SFT JSONL
 - `--resume_from_checkpoint <path>`
+- `--sample_log_steps 200` and `--sample_log_count 2`
+- `--disable_sample_logging` to turn preview printing off
 
 Resume example:
 

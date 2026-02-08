@@ -26,6 +26,7 @@ from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
     Trainer,
+    TrainerCallback,
     TrainingArguments,
     default_data_collator,
     set_seed,
@@ -284,6 +285,75 @@ class PackedCausalDataset(IterableDataset):
                 }
 
 
+def _truncate_for_log(text: str, max_chars: int) -> str:
+    t = normalize_text(text).replace("\n", " ")
+    if len(t) <= max_chars:
+        return t
+    return t[: max(16, max_chars - 3)] + "..."
+
+
+def build_text_preview_samples(
+    sources: List[Tuple[str, Callable[[], Iterator[str]]]],
+    per_source: int,
+) -> List[Tuple[str, str]]:
+    previews: List[Tuple[str, str]] = []
+    if not sources or per_source <= 0:
+        return previews
+
+    local_first = [s for s in sources if s[0].startswith("local_")] + [s for s in sources if not s[0].startswith("local_")]
+    for name, fn in local_first:
+        collected = 0
+        try:
+            for text in fn():
+                if not text:
+                    continue
+                previews.append((name, text))
+                collected += 1
+                if collected >= per_source:
+                    break
+        except Exception:
+            continue
+    return previews
+
+
+class TextSampleLoggingCallback(TrainerCallback):
+    def __init__(
+        self,
+        previews: List[Tuple[str, str]],
+        every_steps: int,
+        sample_count: int,
+        max_chars: int,
+        seed: int,
+    ) -> None:
+        self.previews = previews
+        self.every_steps = max(1, int(every_steps))
+        self.sample_count = max(1, int(sample_count))
+        self.max_chars = max(40, int(max_chars))
+        self.seed = int(seed)
+        self._last_logged_step = -1
+
+    def on_step_end(self, args, state, control, **kwargs):
+        step = int(getattr(state, "global_step", 0))
+        if step <= 0 or step == self._last_logged_step:
+            return control
+        if step % self.every_steps != 0:
+            return control
+        self._last_logged_step = step
+        if not self.previews:
+            return control
+
+        rnd = random.Random(self.seed + step)
+        count = min(self.sample_count, len(self.previews))
+        picks = rnd.sample(self.previews, count) if len(self.previews) > count else list(self.previews)
+
+        print(f"\n[Sample Preview][base][step {step}]")
+        for idx, (src, text) in enumerate(picks, start=1):
+            snippet = _truncate_for_log(text, self.max_chars)
+            print(f"{idx}. {src}: {snippet}")
+        print("")
+        return control
+
+
 def save_interrupt_checkpoint(trainer: Trainer, tokenizer: AutoTokenizer, out_dir: Path, reason: str) -> Path:
     step = int(getattr(trainer.state, "global_step", 0))
     if step > 0 and hasattr(trainer, "_save_checkpoint"):
@@ -344,6 +414,11 @@ def main() -> None:
     ap.add_argument("--logging_steps", type=int, default=20)
     ap.add_argument("--save_steps", type=int, default=500)
     ap.add_argument("--save_total_limit", type=int, default=4)
+    ap.add_argument("--sample_log_steps", type=int, default=200, help="Print preview samples every N optimizer steps (0 disables)")
+    ap.add_argument("--sample_log_count", type=int, default=2, help="How many samples to print each preview event")
+    ap.add_argument("--sample_log_max_chars", type=int, default=220, help="Max characters per printed sample")
+    ap.add_argument("--sample_preview_per_source", type=int, default=1, help="How many preview samples to collect per source at startup")
+    ap.add_argument("--disable_sample_logging", action="store_true")
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--dtype", default="auto", choices=["auto", "float16", "bfloat16", "float32"])
     ap.add_argument("--gradient_checkpointing", action="store_true")
@@ -418,6 +493,22 @@ def main() -> None:
     if not sources:
         raise SystemExit("No training sources found. Provide --hf_source or local data globs.")
 
+    sample_previews: List[Tuple[str, str]] = []
+    if (not args.disable_sample_logging) and int(args.sample_log_steps) > 0:
+        sample_previews = build_text_preview_samples(
+            sources=sources,
+            per_source=max(1, int(args.sample_preview_per_source)),
+        )
+        if sample_previews:
+            print(
+                "Sample logging enabled "
+                f"(every {int(args.sample_log_steps)} steps, "
+                f"{int(args.sample_log_count)} sample(s), "
+                f"{len(sample_previews)} preview rows cached)."
+            )
+        else:
+            print("Sample logging requested but no preview rows could be collected.")
+
     text_iter_factory = make_round_robin_text_iter(
         sources=sources,
         repeat=bool(args.repeat_sources),
@@ -462,6 +553,17 @@ def main() -> None:
         args=targs,
         train_dataset=dataset,
         data_collator=default_data_collator,
+        callbacks=[
+            TextSampleLoggingCallback(
+                previews=sample_previews,
+                every_steps=int(args.sample_log_steps),
+                sample_count=int(args.sample_log_count),
+                max_chars=int(args.sample_log_max_chars),
+                seed=int(args.seed),
+            )
+        ]
+        if sample_previews and (not args.disable_sample_logging) and int(args.sample_log_steps) > 0
+        else None,
     )
     old_sigint = signal.getsignal(signal.SIGINT)
     old_sigterm = signal.getsignal(signal.SIGTERM) if hasattr(signal, "SIGTERM") else None
