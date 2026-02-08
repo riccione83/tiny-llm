@@ -8,6 +8,7 @@ Uses PEFT + Transformers Trainer with streaming datasets.
 from __future__ import annotations
 
 import argparse
+import inspect
 import json
 import random
 import re
@@ -73,6 +74,36 @@ def resolve_dtype(name: str) -> torch.dtype:
     if n in {"float32", "fp32"}:
         return torch.float32
     raise ValueError(f"Unsupported dtype: {name}")
+
+
+def load_causal_lm(model_id_or_path: str, dtype: torch.dtype, trust_remote_code: bool):
+    kwargs = {"trust_remote_code": bool(trust_remote_code)}
+    try:
+        return AutoModelForCausalLM.from_pretrained(
+            model_id_or_path,
+            dtype=dtype,
+            **kwargs,
+        )
+    except TypeError:
+        return AutoModelForCausalLM.from_pretrained(
+            model_id_or_path,
+            torch_dtype=dtype,
+            **kwargs,
+        )
+
+
+def make_training_arguments(**kwargs) -> TrainingArguments:
+    supported = set(inspect.signature(TrainingArguments.__init__).parameters.keys())
+    filtered = {}
+    dropped: List[str] = []
+    for k, v in kwargs.items():
+        if k in supported:
+            filtered[k] = v
+        else:
+            dropped.append(k)
+    if dropped:
+        print(f"TrainingArguments compatibility: ignoring unsupported args: {', '.join(sorted(dropped))}")
+    return TrainingArguments(**filtered)
 
 
 def parse_hf_source(spec: str, fallback_max_rows: int) -> HFSource:
@@ -494,9 +525,9 @@ def main() -> None:
         tokenizer.pad_token_id = 0
 
     dtype = resolve_dtype(args.dtype)
-    model = AutoModelForCausalLM.from_pretrained(
-        args.model_dir,
-        torch_dtype=dtype,
+    model = load_causal_lm(
+        model_id_or_path=args.model_dir,
+        dtype=dtype,
         trust_remote_code=bool(args.trust_remote_code),
     )
 
@@ -575,7 +606,7 @@ def main() -> None:
     use_bf16 = dtype == torch.bfloat16 and torch.cuda.is_available()
     use_fp16 = dtype == torch.float16 and torch.cuda.is_available()
 
-    targs = TrainingArguments(
+    targs = make_training_arguments(
         output_dir=str(out),
         overwrite_output_dir=True,
         save_strategy="steps",

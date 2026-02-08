@@ -25,6 +25,22 @@ def resolve_dtype(name: str) -> torch.dtype:
     raise ValueError(f"Unsupported dtype: {name}")
 
 
+def load_causal_lm(model_id_or_path: str, dtype: torch.dtype, trust_remote_code: bool):
+    kwargs = {"trust_remote_code": bool(trust_remote_code)}
+    try:
+        return AutoModelForCausalLM.from_pretrained(
+            model_id_or_path,
+            dtype=dtype,
+            **kwargs,
+        )
+    except TypeError:
+        return AutoModelForCausalLM.from_pretrained(
+            model_id_or_path,
+            torch_dtype=dtype,
+            **kwargs,
+        )
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="Download base model for LoRA training")
     ap.add_argument("--model_id", default="Qwen/Qwen3-4B-Instruct-2507")
@@ -45,9 +61,9 @@ def main() -> None:
         tok.pad_token = tok.eos_token
 
     dtype = resolve_dtype(args.dtype)
-    model = AutoModelForCausalLM.from_pretrained(
-        args.model_id,
-        torch_dtype=dtype,
+    model = load_causal_lm(
+        model_id_or_path=args.model_id,
+        dtype=dtype,
         trust_remote_code=bool(args.trust_remote_code),
     )
     model.save_pretrained(str(out), safe_serialization=True)

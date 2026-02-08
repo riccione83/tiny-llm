@@ -11,6 +11,7 @@ Design goals:
 from __future__ import annotations
 
 import argparse
+import inspect
 import json
 import random
 import re
@@ -82,6 +83,156 @@ def resolve_dtype(name: str) -> torch.dtype:
     if n in {"float32", "fp32"}:
         return torch.float32
     raise ValueError(f"Unsupported dtype: {name}")
+
+
+def load_causal_lm(model_id_or_path: str, dtype: torch.dtype, trust_remote_code: bool):
+    kwargs = {"trust_remote_code": bool(trust_remote_code)}
+    try:
+        return AutoModelForCausalLM.from_pretrained(
+            model_id_or_path,
+            dtype=dtype,
+            **kwargs,
+        )
+    except TypeError:
+        return AutoModelForCausalLM.from_pretrained(
+            model_id_or_path,
+            torch_dtype=dtype,
+            **kwargs,
+        )
+
+
+def make_training_arguments(**kwargs) -> TrainingArguments:
+    supported = set(inspect.signature(TrainingArguments.__init__).parameters.keys())
+    filtered = {}
+    dropped: List[str] = []
+    for k, v in kwargs.items():
+        if k in supported:
+            filtered[k] = v
+        else:
+            dropped.append(k)
+    if dropped:
+        print(f"TrainingArguments compatibility: ignoring unsupported args: {', '.join(sorted(dropped))}")
+    return TrainingArguments(**filtered)
+
+
+def parse_int_csv(spec: str, fallback: List[int]) -> List[int]:
+    vals: List[int] = []
+    for part in (spec or "").split(","):
+        p = part.strip()
+        if not p:
+            continue
+        try:
+            v = int(p)
+            if v > 0:
+                vals.append(v)
+        except Exception:
+            continue
+    if not vals:
+        return list(fallback)
+    return sorted(set(vals))
+
+
+def probe_shape_fits(model, vocab_size: int, batch_size: int, seq_len: int) -> Tuple[bool, int]:
+    if not torch.cuda.is_available():
+        return True, 0
+
+    device = torch.device("cuda")
+    try:
+        model.train()
+        model.zero_grad(set_to_none=True)
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats(device)
+
+        input_ids = torch.randint(
+            low=0,
+            high=max(10, int(vocab_size)),
+            size=(int(batch_size), int(seq_len)),
+            device=device,
+            dtype=torch.long,
+        )
+        attention_mask = torch.ones_like(input_ids)
+        labels = input_ids.clone()
+        out = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
+        loss = out.loss
+        loss.backward()
+        peak = int(torch.cuda.max_memory_allocated(device))
+        del out, loss, input_ids, attention_mask, labels
+        model.zero_grad(set_to_none=True)
+        torch.cuda.empty_cache()
+        return True, peak
+    except RuntimeError as exc:
+        msg = str(exc).lower()
+        if "out of memory" in msg or "cuda error" in msg:
+            model.zero_grad(set_to_none=True)
+            torch.cuda.empty_cache()
+            return False, 0
+        raise
+
+
+def auto_tune_training_shape(
+    model,
+    tokenizer,
+    init_batch_size: int,
+    init_block_size: int,
+    batch_candidates: List[int],
+    block_candidates: List[int],
+    target_vram_frac: float,
+    max_trials: int,
+) -> Tuple[int, int]:
+    if not torch.cuda.is_available():
+        return int(init_batch_size), int(init_block_size)
+
+    model.to("cuda")
+    vocab_size = int(getattr(tokenizer, "vocab_size", 0) or getattr(model.config, "vocab_size", 50257))
+    max_positions = int(getattr(model.config, "max_position_embeddings", 32768) or 32768)
+    blocks = [b for b in block_candidates if 16 <= int(b) <= max_positions]
+    if not blocks:
+        blocks = [int(init_block_size)]
+
+    batches = [b for b in batch_candidates if int(b) > 0]
+    if not batches:
+        batches = [int(init_batch_size)]
+
+    combos = sorted(
+        {(int(b), int(s)) for b in batches for s in blocks},
+        key=lambda x: (x[0] * x[1], x[1], x[0]),
+        reverse=True,
+    )
+    if int(max_trials) > 0:
+        combos = combos[: int(max_trials)]
+
+    total_mem = int(torch.cuda.get_device_properties(0).total_memory)
+    fits: List[Tuple[int, int, int, float]] = []
+
+    print(
+        "Auto-tuning GPU shape: "
+        f"{len(combos)} trial(s), target VRAM <= {max(0.5, min(0.99, float(target_vram_frac))):.2f}"
+    )
+    for bs, seq in combos:
+        ok, peak = probe_shape_fits(model, vocab_size=vocab_size, batch_size=bs, seq_len=seq)
+        if not ok:
+            print(f"- bs={bs}, block={seq}: OOM")
+            continue
+        frac = float(peak) / float(total_mem) if total_mem > 0 else 0.0
+        fits.append((bs, seq, peak, frac))
+        print(f"- bs={bs}, block={seq}: OK (peak={peak // (1024**2)} MB, frac={frac:.3f})")
+
+    if not fits:
+        print("Auto-tuning found no valid shape; keeping current batch/block values.")
+        return int(init_batch_size), int(init_block_size)
+
+    target = max(0.5, min(0.99, float(target_vram_frac)))
+    preferred = [x for x in fits if x[3] <= target]
+    chosen_pool = preferred if preferred else fits
+    chosen = max(chosen_pool, key=lambda x: (x[0] * x[1], x[1], x[0]))
+    chosen_bs, chosen_block, chosen_peak, chosen_frac = chosen
+
+    print(
+        "Auto-tuning selected: "
+        f"batch_size={chosen_bs}, block_size={chosen_block} "
+        f"(peak={chosen_peak // (1024**2)} MB, frac={chosen_frac:.3f})"
+    )
+    return int(chosen_bs), int(chosen_block)
 
 
 def parse_hf_source(spec: str, fallback_max_texts: int) -> HFSource:
@@ -403,10 +554,15 @@ def main() -> None:
     ap.add_argument("--max_texts_per_source", type=int, default=0, help="0 = use recipe defaults")
     ap.add_argument("--repeat_sources", action="store_true")
 
-    ap.add_argument("--block_size", type=int, default=1024)
+    ap.add_argument("--block_size", type=int, default=1280)
+    ap.add_argument("--auto_tune_shape", action="store_true", help="Auto-find the largest safe batch/block shape on GPU")
+    ap.add_argument("--auto_tune_target_vram_frac", type=float, default=0.93, help="Max VRAM fraction target for auto-tuned shape")
+    ap.add_argument("--auto_tune_batch_candidates", default="2,3,4,5,6", help="CSV list of batch sizes to probe")
+    ap.add_argument("--auto_tune_block_candidates", default="1024,1280,1536,1792,2048", help="CSV list of block sizes to probe")
+    ap.add_argument("--auto_tune_max_trials", type=int, default=24, help="Max number of shape probes")
     ap.add_argument("--max_steps", type=int, default=30_000)
-    ap.add_argument("--per_device_batch_size", type=int, default=1)
-    ap.add_argument("--grad_accum", type=int, default=16)
+    ap.add_argument("--per_device_batch_size", type=int, default=2)
+    ap.add_argument("--grad_accum", type=int, default=8)
     ap.add_argument("--learning_rate", type=float, default=2e-5)
     ap.add_argument("--weight_decay", type=float, default=0.1)
     ap.add_argument("--warmup_ratio", type=float, default=0.03)
@@ -439,9 +595,9 @@ def main() -> None:
         tokenizer.pad_token = tokenizer.eos_token
 
     dtype = resolve_dtype(args.dtype)
-    model = AutoModelForCausalLM.from_pretrained(
-        args.model_dir,
-        torch_dtype=dtype,
+    model = load_causal_lm(
+        model_id_or_path=args.model_dir,
+        dtype=dtype,
         trust_remote_code=bool(args.trust_remote_code),
     )
     model.config.use_cache = False
@@ -451,6 +607,25 @@ def main() -> None:
 
     if args.gradient_checkpointing:
         model.gradient_checkpointing_enable()
+
+    if args.auto_tune_shape:
+        tuned_bs, tuned_block = auto_tune_training_shape(
+            model=model,
+            tokenizer=tokenizer,
+            init_batch_size=int(args.per_device_batch_size),
+            init_block_size=int(args.block_size),
+            batch_candidates=parse_int_csv(args.auto_tune_batch_candidates, fallback=[int(args.per_device_batch_size)]),
+            block_candidates=parse_int_csv(args.auto_tune_block_candidates, fallback=[int(args.block_size)]),
+            target_vram_frac=float(args.auto_tune_target_vram_frac),
+            max_trials=int(args.auto_tune_max_trials),
+        )
+        args.per_device_batch_size = int(tuned_bs)
+        args.block_size = int(tuned_block)
+        print(
+            "Using auto-tuned shape: "
+            f"per_device_batch_size={int(args.per_device_batch_size)}, "
+            f"block_size={int(args.block_size)}"
+        )
 
     sources: List[Tuple[str, Callable[[], Iterator[str]]]] = []
     if not args.disable_hf_data:
@@ -523,7 +698,7 @@ def main() -> None:
     use_bf16 = dtype == torch.bfloat16 and torch.cuda.is_available()
     use_fp16 = dtype == torch.float16 and torch.cuda.is_available()
 
-    targs = TrainingArguments(
+    targs = make_training_arguments(
         output_dir=str(out),
         overwrite_output_dir=True,
         save_strategy="steps",

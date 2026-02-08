@@ -25,6 +25,22 @@ def resolve_dtype(name: str) -> torch.dtype | None:
     raise ValueError(f"Unsupported dtype: {name}")
 
 
+def load_causal_lm(model_id_or_path: str, dtype: torch.dtype, trust_remote_code: bool):
+    kwargs = {"trust_remote_code": bool(trust_remote_code)}
+    try:
+        return AutoModelForCausalLM.from_pretrained(
+            model_id_or_path,
+            dtype=dtype,
+            **kwargs,
+        )
+    except TypeError:
+        return AutoModelForCausalLM.from_pretrained(
+            model_id_or_path,
+            torch_dtype=dtype,
+            **kwargs,
+        )
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="Download a base model for full fine-tuning")
     ap.add_argument("--model_id", default="Qwen/Qwen2.5-0.5B-Instruct")
@@ -44,9 +60,9 @@ def main() -> None:
     if tok.pad_token is None and tok.eos_token is not None:
         tok.pad_token = tok.eos_token
     dtype = resolve_dtype(args.dtype)
-    model = AutoModelForCausalLM.from_pretrained(
-        args.model_id,
-        torch_dtype=dtype,
+    model = load_causal_lm(
+        model_id_or_path=args.model_id,
+        dtype=dtype,
         trust_remote_code=bool(args.trust_remote_code),
     )
     model.save_pretrained(str(out), safe_serialization=True)
