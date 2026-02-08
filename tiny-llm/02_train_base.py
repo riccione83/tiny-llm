@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import inspect
 import json
+import platform
 import random
 import re
 import signal
@@ -85,8 +86,16 @@ def resolve_dtype(name: str) -> torch.dtype:
     raise ValueError(f"Unsupported dtype: {name}")
 
 
-def load_causal_lm(model_id_or_path: str, dtype: torch.dtype, trust_remote_code: bool):
+def load_causal_lm(
+    model_id_or_path: str,
+    dtype: torch.dtype,
+    trust_remote_code: bool,
+    attn_implementation: str,
+):
     kwargs = {"trust_remote_code": bool(trust_remote_code)}
+    attn_impl = resolve_attn_implementation(attn_implementation)
+    if attn_impl:
+        kwargs["attn_implementation"] = attn_impl
     try:
         return AutoModelForCausalLM.from_pretrained(
             model_id_or_path,
@@ -94,11 +103,67 @@ def load_causal_lm(model_id_or_path: str, dtype: torch.dtype, trust_remote_code:
             **kwargs,
         )
     except TypeError:
+        kwargs.pop("attn_implementation", None)
         return AutoModelForCausalLM.from_pretrained(
             model_id_or_path,
             torch_dtype=dtype,
             **kwargs,
         )
+
+
+def resolve_attn_implementation(spec: str) -> Optional[str]:
+    name = (spec or "auto").strip().lower()
+    if name in {"", "none"}:
+        return None
+    if name == "auto":
+        return "sdpa" if torch.cuda.is_available() else None
+    return name
+
+
+def configure_torch_runtime(enable_tf32: bool) -> None:
+    if not torch.cuda.is_available():
+        return
+    if hasattr(torch.backends.cuda.matmul, "allow_tf32"):
+        torch.backends.cuda.matmul.allow_tf32 = bool(enable_tf32)
+    if hasattr(torch.backends.cudnn, "allow_tf32"):
+        torch.backends.cudnn.allow_tf32 = bool(enable_tf32)
+    if enable_tf32:
+        try:
+            torch.set_float32_matmul_precision("high")
+        except Exception:
+            pass
+
+
+def resolve_optimizer_name(use_fused_optimizer: bool) -> str:
+    base = "adamw_torch"
+    if not use_fused_optimizer or (not torch.cuda.is_available()):
+        return base
+    try:
+        from transformers.training_args import OptimizerNames
+
+        available = {str(x.value) if hasattr(x, "value") else str(x) for x in OptimizerNames}
+        if "adamw_torch_fused" not in available:
+            return base
+    except Exception:
+        return base
+    try:
+        if "fused" not in inspect.signature(torch.optim.AdamW.__init__).parameters:
+            return base
+    except Exception:
+        return base
+    return "adamw_torch_fused"
+
+
+def resolve_torch_compile_backend(spec: str) -> Optional[str]:
+    name = (spec or "auto").strip().lower()
+    if name in {"", "none"}:
+        return None
+    if name != "auto":
+        return name
+    # On current Windows + CUDA stacks, inductor can fail at runtime on some setups.
+    if platform.system().lower().startswith("win"):
+        return "aot_eager"
+    return "inductor"
 
 
 def make_training_arguments(**kwargs) -> TrainingArguments:
@@ -443,6 +508,13 @@ def _truncate_for_log(text: str, max_chars: int) -> str:
     return t[: max(16, max_chars - 3)] + "..."
 
 
+DEFAULT_EVAL_PROMPTS: List[str] = [
+    "Write a short friendly greeting in Italian for a new user.",
+    "Explain in simple words what binary search is and when to use it.",
+    "Give 3 practical tips to improve Python code quality.",
+]
+
+
 def build_text_preview_samples(
     sources: List[Tuple[str, Callable[[], Iterator[str]]]],
     per_source: int,
@@ -471,36 +543,122 @@ class TextSampleLoggingCallback(TrainerCallback):
     def __init__(
         self,
         previews: List[Tuple[str, str]],
+        tokenizer: AutoTokenizer,
+        eval_prompts: List[str],
         every_steps: int,
         sample_count: int,
         max_chars: int,
+        gen_max_new_tokens: int,
+        gen_temperature: float,
+        gen_top_p: float,
         seed: int,
     ) -> None:
         self.previews = previews
+        self.tokenizer = tokenizer
+        self.eval_prompts = [normalize_text(x) for x in eval_prompts if normalize_text(x)]
         self.every_steps = max(1, int(every_steps))
         self.sample_count = max(1, int(sample_count))
         self.max_chars = max(40, int(max_chars))
+        self.gen_max_new_tokens = max(8, int(gen_max_new_tokens))
+        self.gen_temperature = max(0.0, float(gen_temperature))
+        self.gen_top_p = float(max(0.05, min(1.0, gen_top_p)))
         self.seed = int(seed)
         self._last_logged_step = -1
 
+    def _pick_eval_prompts(self, step: int) -> List[str]:
+        if not self.eval_prompts:
+            return []
+        rnd = random.Random(self.seed + step + 13_337)
+        count = min(self.sample_count, len(self.eval_prompts))
+        if len(self.eval_prompts) <= count:
+            return list(self.eval_prompts)
+        return rnd.sample(self.eval_prompts, count)
+
+    def _generate_preview(self, model, prompt: str, step: int) -> str:
+        device = next(model.parameters()).device
+        inputs = self.tokenizer(
+            prompt,
+            return_tensors="pt",
+            truncation=True,
+            max_length=512,
+        )
+        inputs = {k: v.to(device) for k, v in inputs.items()}
+        do_sample = self.gen_temperature > 0.0
+        gen_kwargs = {
+            "max_new_tokens": int(self.gen_max_new_tokens),
+            "pad_token_id": int(self.tokenizer.pad_token_id or self.tokenizer.eos_token_id or 0),
+            "eos_token_id": int(self.tokenizer.eos_token_id) if self.tokenizer.eos_token_id is not None else None,
+            "do_sample": bool(do_sample),
+        }
+        if do_sample:
+            gen_kwargs["temperature"] = float(self.gen_temperature)
+            gen_kwargs["top_p"] = float(self.gen_top_p)
+
+        cpu_state = torch.random.get_rng_state()
+        cuda_states = None
+        if torch.cuda.is_available():
+            cuda_states = torch.cuda.get_rng_state_all()
+            torch.cuda.manual_seed_all(self.seed + step)
+        torch.manual_seed(self.seed + step)
+
+        try:
+            with torch.no_grad():
+                out = model.generate(**inputs, **gen_kwargs)
+            generated_ids = out[0][inputs["input_ids"].shape[1] :]
+            text = self.tokenizer.decode(generated_ids, skip_special_tokens=True)
+            return normalize_text(text)
+        finally:
+            torch.random.set_rng_state(cpu_state)
+            if cuda_states is not None:
+                torch.cuda.set_rng_state_all(cuda_states)
+
     def on_step_end(self, args, state, control, **kwargs):
         step = int(getattr(state, "global_step", 0))
+        if hasattr(state, "is_local_process_zero") and not bool(state.is_local_process_zero):
+            return control
         if step <= 0 or step == self._last_logged_step:
             return control
         if step % self.every_steps != 0:
             return control
         self._last_logged_step = step
-        if not self.previews:
+        if not self.previews and not self.eval_prompts:
             return control
 
-        rnd = random.Random(self.seed + step)
-        count = min(self.sample_count, len(self.previews))
-        picks = rnd.sample(self.previews, count) if len(self.previews) > count else list(self.previews)
-
         print(f"\n[Sample Preview][base][step {step}]")
-        for idx, (src, text) in enumerate(picks, start=1):
-            snippet = _truncate_for_log(text, self.max_chars)
-            print(f"{idx}. {src}: {snippet}")
+
+        if self.previews:
+            rnd = random.Random(self.seed + step)
+            count = min(self.sample_count, len(self.previews))
+            picks = rnd.sample(self.previews, count) if len(self.previews) > count else list(self.previews)
+            print("[Data]")
+            for idx, (src, text) in enumerate(picks, start=1):
+                snippet = _truncate_for_log(text, self.max_chars)
+                print(f"{idx}. {src}: {snippet}")
+
+        eval_prompts = self._pick_eval_prompts(step)
+        model = kwargs.get("model")
+        if model is not None and eval_prompts:
+            print("[Generation]")
+            was_training = bool(model.training)
+            had_use_cache = hasattr(model.config, "use_cache")
+            old_use_cache = getattr(model.config, "use_cache", None)
+            model.eval()
+            if had_use_cache:
+                model.config.use_cache = True
+            for idx, prompt in enumerate(eval_prompts, start=1):
+                prompt_snippet = _truncate_for_log(prompt, self.max_chars)
+                try:
+                    completion = self._generate_preview(model, prompt, step)
+                    completion_snippet = _truncate_for_log(completion, self.max_chars)
+                except Exception as exc:
+                    completion_snippet = f"[generation_error] {type(exc).__name__}: {exc}"
+                print(f"{idx}. prompt: {prompt_snippet}")
+                print(f"   out: {completion_snippet}")
+            if had_use_cache:
+                model.config.use_cache = old_use_cache
+            if was_training:
+                model.train()
+
         print("")
         return control
 
@@ -573,8 +731,62 @@ def main() -> None:
     ap.add_argument("--sample_log_steps", type=int, default=200, help="Print preview samples every N optimizer steps (0 disables)")
     ap.add_argument("--sample_log_count", type=int, default=2, help="How many samples to print each preview event")
     ap.add_argument("--sample_log_max_chars", type=int, default=220, help="Max characters per printed sample")
-    ap.add_argument("--sample_preview_per_source", type=int, default=1, help="How many preview samples to collect per source at startup")
+    ap.add_argument("--sample_gen_max_new_tokens", type=int, default=96, help="Max generated tokens per eval sample preview")
+    ap.add_argument("--sample_gen_temperature", type=float, default=0.7, help="Generation temperature for eval previews (0 = greedy)")
+    ap.add_argument("--sample_gen_top_p", type=float, default=0.9, help="Top-p for eval preview generation when temperature > 0")
+    ap.add_argument(
+        "--sample_eval_prompt",
+        action="append",
+        default=[],
+        help="Extra eval prompt used in sample generation preview (can be repeated)",
+    )
+    ap.add_argument("--sample_preview_per_source", type=int, default=0, help="How many data preview samples to collect per source at startup (0 disables source prefetch)")
     ap.add_argument("--disable_sample_logging", action="store_true")
+    ap.add_argument(
+        "--ignore_data_skip",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="When resuming, do not iterate/skip old batches (recommended for streaming IterableDataset).",
+    )
+    ap.add_argument(
+        "--use_fused_optimizer",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use fused AdamW when supported by torch/transformers.",
+    )
+    ap.add_argument(
+        "--tf32",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable TF32 tensor cores on supported NVIDIA GPUs.",
+    )
+    ap.add_argument(
+        "--attn_implementation",
+        default="auto",
+        choices=["auto", "eager", "sdpa", "flash_attention_2"],
+        help="Attention kernel backend. auto=sdpa on CUDA, none on CPU.",
+    )
+    ap.add_argument(
+        "--torch_compile",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Enable torch.compile in Trainer (good for long runs, slower startup).",
+    )
+    ap.add_argument(
+        "--torch_compile_mode",
+        default="max-autotune",
+        help="Compile mode when --torch_compile is enabled (e.g. max-autotune, reduce-overhead).",
+    )
+    ap.add_argument(
+        "--torch_compile_backend",
+        default="auto",
+        help="Compile backend (auto, inductor, aot_eager, eager, ...).",
+    )
+    ap.add_argument(
+        "--throughput_mode",
+        action="store_true",
+        help="Shorthand for high-throughput runtime settings (enables torch_compile, tf32 and fused optimizer).",
+    )
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--dtype", default="auto", choices=["auto", "float16", "bfloat16", "float32"])
     ap.add_argument("--gradient_checkpointing", action="store_true")
@@ -582,9 +794,20 @@ def main() -> None:
     ap.add_argument("--resume_from_checkpoint", default="")
     args = ap.parse_args()
 
+    if args.throughput_mode:
+        compile_backend_auto = str(args.torch_compile_backend).strip().lower() in {"", "auto"}
+        if platform.system().lower().startswith("win") and compile_backend_auto:
+            # Keep throughput mode safe by default on Windows.
+            args.torch_compile = False
+        else:
+            args.torch_compile = True
+        args.tf32 = True
+        args.use_fused_optimizer = True
+
     set_seed(int(args.seed))
     out = Path(args.output_dir)
     out.mkdir(parents=True, exist_ok=True)
+    configure_torch_runtime(bool(args.tf32))
 
     tokenizer = AutoTokenizer.from_pretrained(
         args.model_dir,
@@ -599,6 +822,7 @@ def main() -> None:
         model_id_or_path=args.model_dir,
         dtype=dtype,
         trust_remote_code=bool(args.trust_remote_code),
+        attn_implementation=str(args.attn_implementation),
     )
     model.config.use_cache = False
 
@@ -669,17 +893,21 @@ def main() -> None:
         raise SystemExit("No training sources found. Provide --hf_source or local data globs.")
 
     sample_previews: List[Tuple[str, str]] = []
+    eval_prompts = list(DEFAULT_EVAL_PROMPTS) + [normalize_text(x) for x in args.sample_eval_prompt if normalize_text(x)]
     if (not args.disable_sample_logging) and int(args.sample_log_steps) > 0:
-        sample_previews = build_text_preview_samples(
-            sources=sources,
-            per_source=max(1, int(args.sample_preview_per_source)),
-        )
-        if sample_previews:
+        preview_per_source = max(0, int(args.sample_preview_per_source))
+        if preview_per_source > 0:
+            sample_previews = build_text_preview_samples(
+                sources=sources,
+                per_source=preview_per_source,
+            )
+        if sample_previews or eval_prompts:
             print(
                 "Sample logging enabled "
                 f"(every {int(args.sample_log_steps)} steps, "
                 f"{int(args.sample_log_count)} sample(s), "
-                f"{len(sample_previews)} preview rows cached)."
+                f"{len(sample_previews)} data preview rows cached, "
+                f"{len(eval_prompts)} eval prompt(s))."
             )
         else:
             print("Sample logging requested but no preview rows could be collected.")
@@ -697,6 +925,17 @@ def main() -> None:
 
     use_bf16 = dtype == torch.bfloat16 and torch.cuda.is_available()
     use_fp16 = dtype == torch.float16 and torch.cuda.is_available()
+    optim_name = resolve_optimizer_name(bool(args.use_fused_optimizer))
+    compile_mode = str(args.torch_compile_mode).strip() or "max-autotune"
+    compile_backend = resolve_torch_compile_backend(str(args.torch_compile_backend))
+
+    print(
+        "Runtime config: "
+        f"optim={optim_name}, tf32={'on' if bool(args.tf32) else 'off'}, "
+        f"torch_compile={'on' if bool(args.torch_compile) else 'off'}"
+        f"{f'[{compile_backend}]' if bool(args.torch_compile) and compile_backend else ''}, "
+        f"attn={resolve_attn_implementation(str(args.attn_implementation)) or 'default'}"
+    )
 
     targs = make_training_arguments(
         output_dir=str(out),
@@ -718,9 +957,14 @@ def main() -> None:
         remove_unused_columns=False,
         dataloader_num_workers=0,
         dataloader_pin_memory=torch.cuda.is_available(),
-        optim="adamw_torch",
+        optim=optim_name,
         save_safetensors=True,
         gradient_checkpointing=bool(args.gradient_checkpointing),
+        ignore_data_skip=bool(args.ignore_data_skip),
+        tf32=bool(args.tf32),
+        torch_compile=bool(args.torch_compile),
+        torch_compile_mode=compile_mode,
+        torch_compile_backend=compile_backend,
     )
 
     trainer = Trainer(
@@ -731,13 +975,18 @@ def main() -> None:
         callbacks=[
             TextSampleLoggingCallback(
                 previews=sample_previews,
+                tokenizer=tokenizer,
+                eval_prompts=eval_prompts,
                 every_steps=int(args.sample_log_steps),
                 sample_count=int(args.sample_log_count),
                 max_chars=int(args.sample_log_max_chars),
+                gen_max_new_tokens=int(args.sample_gen_max_new_tokens),
+                gen_temperature=float(args.sample_gen_temperature),
+                gen_top_p=float(args.sample_gen_top_p),
                 seed=int(args.seed),
             )
         ]
-        if sample_previews and (not args.disable_sample_logging) and int(args.sample_log_steps) > 0
+        if (sample_previews or eval_prompts) and (not args.disable_sample_logging) and int(args.sample_log_steps) > 0
         else None,
     )
     old_sigint = signal.getsignal(signal.SIGINT)
@@ -757,6 +1006,11 @@ def main() -> None:
 
     interrupted = False
     try:
+        if args.resume_from_checkpoint:
+            print(
+                "Resume mode: "
+                f"ignore_data_skip={'true' if bool(args.ignore_data_skip) else 'false'}"
+            )
         trainer.train(resume_from_checkpoint=args.resume_from_checkpoint or None)
     except KeyboardInterrupt:
         interrupted = True
