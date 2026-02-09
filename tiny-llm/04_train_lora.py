@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import inspect
 import json
+import platform
 import random
 import re
 import signal
@@ -84,8 +85,70 @@ def resolve_dtype(name: str) -> torch.dtype:
     raise ValueError(f"Unsupported dtype: {name}")
 
 
-def load_causal_lm(model_id_or_path: str, dtype: torch.dtype, trust_remote_code: bool):
+def resolve_attn_implementation(spec: str) -> Optional[str]:
+    name = (spec or "auto").strip().lower()
+    if name in {"", "none"}:
+        return None
+    if name == "auto":
+        return "sdpa" if torch.cuda.is_available() else None
+    return name
+
+
+def configure_torch_runtime(enable_tf32: bool) -> None:
+    if not torch.cuda.is_available():
+        return
+    if hasattr(torch.backends.cuda.matmul, "allow_tf32"):
+        torch.backends.cuda.matmul.allow_tf32 = bool(enable_tf32)
+    if hasattr(torch.backends.cudnn, "allow_tf32"):
+        torch.backends.cudnn.allow_tf32 = bool(enable_tf32)
+    if enable_tf32:
+        try:
+            torch.set_float32_matmul_precision("high")
+        except Exception:
+            pass
+
+
+def resolve_optimizer_name(use_fused_optimizer: bool) -> str:
+    base = "adamw_torch"
+    if not use_fused_optimizer or (not torch.cuda.is_available()):
+        return base
+    try:
+        from transformers.training_args import OptimizerNames
+
+        available = {str(x.value) if hasattr(x, "value") else str(x) for x in OptimizerNames}
+        if "adamw_torch_fused" not in available:
+            return base
+    except Exception:
+        return base
+    try:
+        if "fused" not in inspect.signature(torch.optim.AdamW.__init__).parameters:
+            return base
+    except Exception:
+        return base
+    return "adamw_torch_fused"
+
+
+def resolve_torch_compile_backend(spec: str) -> Optional[str]:
+    name = (spec or "auto").strip().lower()
+    if name in {"", "none"}:
+        return None
+    if name != "auto":
+        return name
+    if platform.system().lower().startswith("win"):
+        return "aot_eager"
+    return "inductor"
+
+
+def load_causal_lm(
+    model_id_or_path: str,
+    dtype: torch.dtype,
+    trust_remote_code: bool,
+    attn_implementation: str,
+):
     kwargs = {"trust_remote_code": bool(trust_remote_code)}
+    attn_impl = resolve_attn_implementation(attn_implementation)
+    if attn_impl:
+        kwargs["attn_implementation"] = attn_impl
     try:
         return AutoModelForCausalLM.from_pretrained(
             model_id_or_path,
@@ -93,6 +156,7 @@ def load_causal_lm(model_id_or_path: str, dtype: torch.dtype, trust_remote_code:
             **kwargs,
         )
     except TypeError:
+        kwargs.pop("attn_implementation", None)
         return AutoModelForCausalLM.from_pretrained(
             model_id_or_path,
             torch_dtype=dtype,
@@ -618,6 +682,37 @@ def main() -> None:
         default=True,
         help="When resuming, do not iterate/skip old batches (recommended for streaming IterableDataset).",
     )
+    ap.add_argument(
+        "--use_fused_optimizer",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use fused AdamW when supported by torch/transformers.",
+    )
+    ap.add_argument(
+        "--tf32",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable TF32 tensor cores on supported NVIDIA GPUs.",
+    )
+    ap.add_argument(
+        "--attn_implementation",
+        default="auto",
+        choices=["auto", "eager", "sdpa", "flash_attention_2"],
+        help="Attention kernel backend. auto=sdpa on CUDA, none on CPU.",
+    )
+    ap.add_argument(
+        "--torch_compile",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Enable torch.compile in Trainer (slower startup).",
+    )
+    ap.add_argument("--torch_compile_mode", default="max-autotune", help="Compile mode when --torch_compile is enabled.")
+    ap.add_argument("--torch_compile_backend", default="auto", help="Compile backend (auto, inductor, aot_eager, eager, ...).")
+    ap.add_argument(
+        "--throughput_mode",
+        action="store_true",
+        help="Shorthand for high-throughput runtime settings (compile+tf32+fused optimizer).",
+    )
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--dtype", default="auto", choices=["auto", "float16", "bfloat16", "float32"])
     ap.add_argument("--gradient_checkpointing", action="store_true")
@@ -631,9 +726,20 @@ def main() -> None:
     ap.add_argument("--save_merged", action="store_true")
     args = ap.parse_args()
 
+    if args.throughput_mode:
+        compile_backend_auto = str(args.torch_compile_backend).strip().lower() in {"", "auto"}
+        if platform.system().lower().startswith("win") and compile_backend_auto:
+            # Keep throughput mode safe by default on Windows.
+            args.torch_compile = False
+        else:
+            args.torch_compile = True
+        args.tf32 = True
+        args.use_fused_optimizer = True
+
     set_seed(int(args.seed))
     out = Path(args.output_dir)
     out.mkdir(parents=True, exist_ok=True)
+    configure_torch_runtime(bool(args.tf32))
 
     tokenizer = AutoTokenizer.from_pretrained(
         args.model_dir,
@@ -654,6 +760,7 @@ def main() -> None:
         model_id_or_path=args.model_dir,
         dtype=dtype,
         trust_remote_code=bool(args.trust_remote_code),
+        attn_implementation=str(args.attn_implementation),
     )
 
     if args.target_modules.strip().lower() == "auto":
@@ -739,6 +846,17 @@ def main() -> None:
 
     use_bf16 = dtype == torch.bfloat16 and torch.cuda.is_available()
     use_fp16 = dtype == torch.float16 and torch.cuda.is_available()
+    optim_name = resolve_optimizer_name(bool(args.use_fused_optimizer))
+    compile_mode = str(args.torch_compile_mode).strip() or "max-autotune"
+    compile_backend = resolve_torch_compile_backend(str(args.torch_compile_backend))
+
+    print(
+        "Runtime config: "
+        f"optim={optim_name}, tf32={'on' if bool(args.tf32) else 'off'}, "
+        f"torch_compile={'on' if bool(args.torch_compile) else 'off'}"
+        f"{f'[{compile_backend}]' if bool(args.torch_compile) and compile_backend else ''}, "
+        f"attn={resolve_attn_implementation(str(args.attn_implementation)) or 'default'}"
+    )
 
     targs = make_training_arguments(
         output_dir=str(out),
@@ -760,10 +878,14 @@ def main() -> None:
         remove_unused_columns=False,
         dataloader_num_workers=0,
         dataloader_pin_memory=torch.cuda.is_available(),
-        optim="adamw_torch",
+        optim=optim_name,
         save_safetensors=True,
         gradient_checkpointing=bool(args.gradient_checkpointing),
         ignore_data_skip=bool(args.ignore_data_skip),
+        tf32=bool(args.tf32),
+        torch_compile=bool(args.torch_compile),
+        torch_compile_mode=compile_mode,
+        torch_compile_backend=compile_backend,
     )
 
     trainer = Trainer(
