@@ -21,7 +21,15 @@ import torch
 from datasets import load_dataset
 from peft import LoraConfig, TaskType, get_peft_model
 from torch.utils.data import IterableDataset
-from transformers import AutoModelForCausalLM, AutoTokenizer, Trainer, TrainerCallback, TrainingArguments, set_seed
+from transformers import (
+    AutoModelForCausalLM,
+    AutoTokenizer,
+    GenerationConfig,
+    Trainer,
+    TrainerCallback,
+    TrainingArguments,
+    set_seed,
+)
 
 
 @dataclass
@@ -309,15 +317,15 @@ class SFTIterableDataset(IterableDataset):
                 input_ids = input_ids + [int(eos)]
 
             if len(input_ids) > self.max_length:
+                # Left-truncate to keep the most recent context while preserving the full answer.
                 overflow = len(input_ids) - self.max_length
                 if overflow >= len(prompt_ids):
                     continue
                 input_ids = input_ids[overflow:]
-                prompt_len = len(prompt_ids) - overflow
-            else:
-                prompt_len = len(prompt_ids)
-
-            labels = [-100] * prompt_len + input_ids[prompt_len:]
+            # Build labels from the answer span (robust to left-truncation).
+            answer_len = len(answer_ids) + (1 if eos is not None else 0)
+            answer_start = max(0, len(input_ids) - answer_len)
+            labels = [-100] * answer_start + input_ids[answer_start:]
             if not any(v != -100 for v in labels):
                 continue
 
@@ -353,6 +361,13 @@ def _truncate_for_log(text: str, max_chars: int) -> str:
     return t[: max(16, max_chars - 3)] + "..."
 
 
+DEFAULT_EVAL_PROMPTS: List[str] = [
+    "User: Ciao! Puoi salutarmi e dirmi in una frase come mi puoi aiutare?\n\nAssistant:",
+    "User: Explain binary search in simple words and state its time complexity.\n\nAssistant:",
+    "User: Write a short Python function that checks if a string is a palindrome.\n\nAssistant:",
+]
+
+
 def build_pair_preview_samples(
     sources: List[Tuple[str, Callable[[], Iterator[Tuple[str, str]]]]],
     per_source: int,
@@ -381,39 +396,130 @@ class PairSampleLoggingCallback(TrainerCallback):
     def __init__(
         self,
         previews: List[Tuple[str, str, str]],
+        tokenizer: AutoTokenizer,
+        eval_prompts: List[str],
         every_steps: int,
         sample_count: int,
         max_chars: int,
+        gen_max_new_tokens: int,
+        gen_temperature: float,
+        gen_top_p: float,
         seed: int,
     ) -> None:
         self.previews = previews
+        self.tokenizer = tokenizer
+        self.eval_prompts = [normalize_text(x) for x in eval_prompts if normalize_text(x)]
         self.every_steps = max(1, int(every_steps))
         self.sample_count = max(1, int(sample_count))
         self.max_chars = max(40, int(max_chars))
+        self.gen_max_new_tokens = max(8, int(gen_max_new_tokens))
+        self.gen_temperature = max(0.0, float(gen_temperature))
+        self.gen_top_p = float(max(0.05, min(1.0, float(gen_top_p))))
         self.seed = int(seed)
         self._last_logged_step = -1
 
+    def _pick_eval_prompts(self, step: int) -> List[str]:
+        if not self.eval_prompts:
+            return []
+        rnd = random.Random(self.seed + step + 13_337)
+        count = min(self.sample_count, len(self.eval_prompts))
+        if len(self.eval_prompts) <= count:
+            return list(self.eval_prompts)
+        return rnd.sample(self.eval_prompts, count)
+
+    def _make_generation_config(self) -> GenerationConfig:
+        do_sample = self.gen_temperature > 0.0
+        cfg = GenerationConfig(
+            max_new_tokens=int(self.gen_max_new_tokens),
+            do_sample=bool(do_sample),
+            pad_token_id=int(self.tokenizer.pad_token_id or self.tokenizer.eos_token_id or 0),
+            eos_token_id=int(self.tokenizer.eos_token_id) if self.tokenizer.eos_token_id is not None else None,
+        )
+        if do_sample:
+            cfg.temperature = float(self.gen_temperature)
+            cfg.top_p = float(self.gen_top_p)
+        return cfg
+
+    def _generate_preview(self, model, prompt: str, step: int) -> str:
+        device = next(model.parameters()).device
+        inputs = self.tokenizer(
+            prompt,
+            return_tensors="pt",
+            truncation=True,
+            max_length=768,
+        )
+        inputs = {k: v.to(device) for k, v in inputs.items()}
+        gen_cfg = self._make_generation_config()
+
+        cpu_state = torch.random.get_rng_state()
+        cuda_states = None
+        if torch.cuda.is_available():
+            cuda_states = torch.cuda.get_rng_state_all()
+            torch.cuda.manual_seed_all(self.seed + step)
+        torch.manual_seed(self.seed + step)
+
+        try:
+            with torch.no_grad():
+                out = model.generate(**inputs, generation_config=gen_cfg)
+            generated_ids = out[0][inputs["input_ids"].shape[1] :]
+            text = self.tokenizer.decode(generated_ids, skip_special_tokens=True)
+            return normalize_text(text)
+        finally:
+            torch.random.set_rng_state(cpu_state)
+            if cuda_states is not None:
+                torch.cuda.set_rng_state_all(cuda_states)
+
     def on_step_end(self, args, state, control, **kwargs):
         step = int(getattr(state, "global_step", 0))
+        if hasattr(state, "is_local_process_zero") and not bool(state.is_local_process_zero):
+            return control
         if step <= 0 or step == self._last_logged_step:
             return control
         if step % self.every_steps != 0:
             return control
         self._last_logged_step = step
-        if not self.previews:
+        if not self.previews and not self.eval_prompts:
             return control
 
-        rnd = random.Random(self.seed + step)
-        count = min(self.sample_count, len(self.previews))
-        picks = rnd.sample(self.previews, count) if len(self.previews) > count else list(self.previews)
-
         print(f"\n[Sample Preview][lora][step {step}]")
-        for idx, (src, prompt, answer) in enumerate(picks, start=1):
-            p = _truncate_for_log(prompt, self.max_chars)
-            a = _truncate_for_log(answer, self.max_chars)
-            print(f"{idx}. {src}")
-            print(f"   prompt: {p}")
-            print(f"   answer: {a}")
+
+        if self.previews:
+            rnd = random.Random(self.seed + step)
+            count = min(self.sample_count, len(self.previews))
+            picks = rnd.sample(self.previews, count) if len(self.previews) > count else list(self.previews)
+
+            print("[Data]")
+            for idx, (src, prompt, answer) in enumerate(picks, start=1):
+                p = _truncate_for_log(prompt, self.max_chars)
+                a = _truncate_for_log(answer, self.max_chars)
+                print(f"{idx}. {src}")
+                print(f"   prompt: {p}")
+                print(f"   answer: {a}")
+
+        eval_prompts = self._pick_eval_prompts(step)
+        model = kwargs.get("model")
+        if model is not None and eval_prompts:
+            print("[Generation]")
+            was_training = bool(model.training)
+            had_use_cache = hasattr(getattr(model, "config", None), "use_cache")
+            old_use_cache = getattr(getattr(model, "config", None), "use_cache", None)
+            model.eval()
+            if had_use_cache:
+                model.config.use_cache = True
+            for idx, prompt in enumerate(eval_prompts, start=1):
+                prompt_snippet = _truncate_for_log(prompt, self.max_chars)
+                try:
+                    completion = self._generate_preview(model, prompt, step)
+                    completion_snippet = _truncate_for_log(completion, self.max_chars)
+                except Exception as exc:
+                    completion_snippet = f"[generation_error] {type(exc).__name__}: {exc}"
+                print(f"{idx}. prompt: {prompt_snippet}")
+                print(f"   out: {completion_snippet}")
+            if had_use_cache:
+                model.config.use_cache = old_use_cache
+            if was_training:
+                model.train()
+
         print("")
         return control
 
@@ -495,8 +601,23 @@ def main() -> None:
     ap.add_argument("--sample_log_steps", type=int, default=200, help="Print preview samples every N optimizer steps (0 disables)")
     ap.add_argument("--sample_log_count", type=int, default=2, help="How many samples to print each preview event")
     ap.add_argument("--sample_log_max_chars", type=int, default=220, help="Max characters per printed prompt/answer")
-    ap.add_argument("--sample_preview_per_source", type=int, default=1, help="How many preview samples to collect per source at startup")
+    ap.add_argument("--sample_gen_max_new_tokens", type=int, default=128, help="Max generated tokens per eval sample preview")
+    ap.add_argument("--sample_gen_temperature", type=float, default=0.0, help="Generation temperature for eval previews (0 = greedy)")
+    ap.add_argument("--sample_gen_top_p", type=float, default=0.9, help="Top-p for eval preview generation when temperature > 0")
+    ap.add_argument(
+        "--sample_eval_prompt",
+        action="append",
+        default=[],
+        help="Extra eval prompt used in sample generation preview (can be repeated)",
+    )
+    ap.add_argument("--sample_preview_per_source", type=int, default=0, help="How many data preview samples to collect per source at startup (0 disables source prefetch)")
     ap.add_argument("--disable_sample_logging", action="store_true")
+    ap.add_argument(
+        "--ignore_data_skip",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="When resuming, do not iterate/skip old batches (recommended for streaming IterableDataset).",
+    )
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--dtype", default="auto", choices=["auto", "float16", "bfloat16", "float32"])
     ap.add_argument("--gradient_checkpointing", action="store_true")
@@ -522,7 +643,11 @@ def main() -> None:
     if tokenizer.pad_token is None and tokenizer.eos_token is not None:
         tokenizer.pad_token = tokenizer.eos_token
     if tokenizer.pad_token_id is None:
-        tokenizer.pad_token_id = 0
+        if tokenizer.eos_token_id is not None:
+            tokenizer.pad_token_id = int(tokenizer.eos_token_id)
+        else:
+            print("Warning: tokenizer has no pad_token_id/eos_token_id; defaulting pad_token_id=0")
+            tokenizer.pad_token_id = 0
 
     dtype = resolve_dtype(args.dtype)
     model = load_causal_lm(
@@ -575,17 +700,21 @@ def main() -> None:
         raise SystemExit("No LoRA training sources found.")
 
     sample_previews: List[Tuple[str, str, str]] = []
+    eval_prompts = list(DEFAULT_EVAL_PROMPTS) + [normalize_text(x) for x in args.sample_eval_prompt if normalize_text(x)]
     if (not args.disable_sample_logging) and int(args.sample_log_steps) > 0:
-        sample_previews = build_pair_preview_samples(
-            sources=sources,
-            per_source=max(1, int(args.sample_preview_per_source)),
-        )
-        if sample_previews:
+        preview_per_source = max(0, int(args.sample_preview_per_source))
+        if preview_per_source > 0:
+            sample_previews = build_pair_preview_samples(
+                sources=sources,
+                per_source=preview_per_source,
+            )
+        if sample_previews or eval_prompts:
             print(
                 "Sample logging enabled "
                 f"(every {int(args.sample_log_steps)} steps, "
                 f"{int(args.sample_log_count)} sample(s), "
-                f"{len(sample_previews)} preview rows cached)."
+                f"{len(sample_previews)} data preview rows cached, "
+                f"{len(eval_prompts)} eval prompt(s))."
             )
         else:
             print("Sample logging requested but no preview rows could be collected.")
@@ -600,6 +729,11 @@ def main() -> None:
         pair_iter_factory=pair_iter_factory,
         max_length=int(args.max_length),
         min_answer_tokens=int(args.min_answer_tokens),
+    )
+    print(
+        "SFT dataset: left-truncate to max_length (keep most recent context), "
+        "preserve full answers (skip if prompt is too long), "
+        "mask prompt tokens in labels."
     )
     collator = SFTCollator(pad_token_id=int(tokenizer.pad_token_id))
 
@@ -629,6 +763,7 @@ def main() -> None:
         optim="adamw_torch",
         save_safetensors=True,
         gradient_checkpointing=bool(args.gradient_checkpointing),
+        ignore_data_skip=bool(args.ignore_data_skip),
     )
 
     trainer = Trainer(
@@ -639,13 +774,18 @@ def main() -> None:
         callbacks=[
             PairSampleLoggingCallback(
                 previews=sample_previews,
+                tokenizer=tokenizer,
+                eval_prompts=eval_prompts,
                 every_steps=int(args.sample_log_steps),
                 sample_count=int(args.sample_log_count),
                 max_chars=int(args.sample_log_max_chars),
+                gen_max_new_tokens=int(args.sample_gen_max_new_tokens),
+                gen_temperature=float(args.sample_gen_temperature),
+                gen_top_p=float(args.sample_gen_top_p),
                 seed=int(args.seed),
             )
         ]
-        if sample_previews and (not args.disable_sample_logging) and int(args.sample_log_steps) > 0
+        if (sample_previews or eval_prompts) and (not args.disable_sample_logging) and int(args.sample_log_steps) > 0
         else None,
     )
     old_sigint = signal.getsignal(signal.SIGINT)
@@ -665,6 +805,11 @@ def main() -> None:
 
     interrupted = False
     try:
+        if args.resume_from_checkpoint:
+            print(
+                "Resume mode: "
+                f"ignore_data_skip={'true' if bool(args.ignore_data_skip) else 'false'}"
+            )
         trainer.train(resume_from_checkpoint=args.resume_from_checkpoint or None)
     except KeyboardInterrupt:
         interrupted = True
