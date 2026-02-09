@@ -3,7 +3,9 @@
 Compatibility wrapper for project eval.
 
 Old command style is still accepted, but evaluation now runs the new
-grounded pipeline in mini_assistant/eval_grounded.py.
+pipelines:
+- grounded: mini_assistant/eval_grounded.py (web QA regression)
+- chat:     mini_assistant/eval_chat_quality.py (offline chat sanity)
 """
 
 import argparse
@@ -14,6 +16,7 @@ from typing import List
 
 def main() -> None:
     ap = argparse.ArgumentParser()
+    ap.add_argument("--suite", default="grounded", choices=["grounded", "chat", "both"])
     # New args
     ap.add_argument("--backend", default="hf", choices=["hf", "tiny"])
     ap.add_argument("--model_name", default="Qwen/Qwen3-4B-Instruct-2507")
@@ -38,37 +41,66 @@ def main() -> None:
 
     args = ap.parse_args()
 
-    cmd: List[str] = [
-        sys.executable,
-        "-m",
-        "mini_assistant.eval_grounded",
-        "--backend",
-        args.backend,
-        "--model_name",
-        args.model_name,
-        "--embedding_model",
-        args.embedding_model,
-        "--tiny_ckpt",
-        args.tiny_ckpt,
-        "--tiny_tokenizer",
-        args.tiny_tokenizer,
-        "--tiny_lora",
-        args.tiny_lora,
-        "--tiny_top_p",
-        str(args.tiny_top_p),
-        "--temperature",
-        str(args.temperature),
-        "--max_new_tokens",
-        str(args.max_new_tokens),
-        "--top_k",
-        str(args.top_k),
-        "--timeout_sec",
-        str(args.timeout_sec),
-        "--out_json",
-        args.out_json,
-    ]
-    p = subprocess.run(cmd)
-    raise SystemExit(p.returncode)
+    rc = 0
+    if args.suite in {"grounded", "both"}:
+        cmd: List[str] = [
+            sys.executable,
+            "-m",
+            "mini_assistant.eval_grounded",
+            "--backend",
+            args.backend,
+            "--model_name",
+            args.model_name,
+            "--embedding_model",
+            args.embedding_model,
+            "--tiny_ckpt",
+            args.tiny_ckpt,
+            "--tiny_tokenizer",
+            args.tiny_tokenizer,
+            "--tiny_lora",
+            args.tiny_lora,
+            "--tiny_top_p",
+            str(args.tiny_top_p),
+            "--temperature",
+            str(args.temperature),
+            "--max_new_tokens",
+            str(args.max_new_tokens),
+            "--top_k",
+            str(args.top_k),
+            "--timeout_sec",
+            str(args.timeout_sec),
+            "--out_json",
+            args.out_json,
+        ]
+        p = subprocess.run(cmd)
+        rc = max(rc, int(p.returncode))
+
+    if args.suite in {"chat", "both"}:
+        cmd2: List[str] = [
+            sys.executable,
+            "-m",
+            "mini_assistant.eval_chat_quality",
+            "--backend",
+            args.backend,
+            "--model_name",
+            args.model_name,
+            "--tiny_ckpt",
+            args.tiny_ckpt,
+            "--tiny_tokenizer",
+            args.tiny_tokenizer,
+            "--tiny_lora",
+            args.tiny_lora,
+            "--tiny_top_p",
+            str(args.tiny_top_p),
+            "--temperature",
+            str(args.temperature),
+            "--max_new_tokens",
+            str(args.max_new_tokens),
+        ]
+        p2 = subprocess.run(cmd2)
+        rc = max(rc, int(p2.returncode))
+
+    raise SystemExit(rc)
 
 
 if __name__ == "__main__":

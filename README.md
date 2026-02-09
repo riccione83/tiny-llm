@@ -58,7 +58,11 @@ Built-in local samples are in `tiny-llm/samples/` and are loaded by default in b
 Run regression eval:
 
 ```powershell
-python 13_eval_chat_quality.py --backend hf --model_name Qwen/Qwen3-4B-Instruct-2507 --embedding_model sentence-transformers/all-MiniLM-L6-v2
+# Grounded (web QA) regression:
+python 13_eval_chat_quality.py --suite grounded --backend hf --model_name Qwen/Qwen3-4B-Instruct-2507 --embedding_model sentence-transformers/all-MiniLM-L6-v2
+
+# Offline chat sanity (no web):
+python 13_eval_chat_quality.py --suite chat --backend hf --model_name Qwen/Qwen3-4B-Instruct-2507
 ```
 
 Run confidence-gate check:
