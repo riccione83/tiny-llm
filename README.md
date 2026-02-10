@@ -13,7 +13,7 @@ Use `tiny-llm/` if you want to train everything locally from scratch.
 - LLM: `Qwen/Qwen3-4B-Instruct-2507`
 - Retriever embeddings: `sentence-transformers/all-MiniLM-L6-v2`
 - Runtime package: `mini_assistant/`
-- Optional local backend: your custom tiny checkpoint from `09_chat.py` (legacy, wrapper; real code in `legacy_chat.py`)
+- Optional local backend: your custom tiny checkpoint from `legacy_chat.py` (legacy custom model backend)
 
 ## Quick Start
 

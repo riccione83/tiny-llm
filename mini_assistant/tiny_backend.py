@@ -7,7 +7,7 @@ import sentencepiece as spm
 import torch
 
 
-def _load_legacy_module(path: str = "09_chat.py"):
+def _load_legacy_module(path: str = "legacy_chat.py"):
     p = Path(path)
     if not p.exists():
         raise FileNotFoundError(f"Missing legacy tiny model file: {p}")
@@ -43,7 +43,7 @@ class TinyLocalLLM:
     def _lazy_load(self) -> None:
         if self._legacy is not None and self._model is not None and self._sp is not None:
             return
-        self._legacy = _load_legacy_module("09_chat.py")
+        self._legacy = _load_legacy_module("legacy_chat.py")
         self._legacy.MAX_NEW_TOKENS = max(16, self.max_new_tokens)
 
         sp = spm.SentencePieceProcessor()
