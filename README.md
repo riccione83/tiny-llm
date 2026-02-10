@@ -13,7 +13,7 @@ Use `tiny-llm/` if you want to train everything locally from scratch.
 - LLM: `Qwen/Qwen3-4B-Instruct-2507`
 - Retriever embeddings: `sentence-transformers/all-MiniLM-L6-v2`
 - Runtime package: `mini_assistant/`
-- Optional local backend: your custom tiny checkpoint from `09_chat.py`
+- Optional local backend: your custom tiny checkpoint from `09_chat.py` (legacy, wrapper; real code in `legacy_chat.py`)
 
 ## Quick Start
 
@@ -59,10 +59,10 @@ Run regression eval:
 
 ```powershell
 # Grounded (web QA) regression:
-python 13_eval_chat_quality.py --suite grounded --backend hf --model_name Qwen/Qwen3-4B-Instruct-2507 --embedding_model sentence-transformers/all-MiniLM-L6-v2
+python .\eval.py --suite grounded --backend hf --model_name Qwen/Qwen3-4B-Instruct-2507 --embedding_model sentence-transformers/all-MiniLM-L6-v2
 
 # Offline chat sanity (no web):
-python 13_eval_chat_quality.py --suite chat --backend hf --model_name Qwen/Qwen3-4B-Instruct-2507
+python .\eval.py --suite chat --backend hf --model_name Qwen/Qwen3-4B-Instruct-2507
 ```
 
 Run confidence-gate check:
