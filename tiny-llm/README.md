@@ -87,6 +87,16 @@ What this script does:
 - Includes local curated SFT samples by default.
 - Prints preview prompt/answer samples during training every `200` steps by default.
 
+Local SFT examples live in `samples/sft/*.jsonl`. If you want the model to follow
+your own fixed prompt format (System + User), add examples there. A starter
+file is provided: `samples/sft/system_styles.jsonl`.
+
+PowerShell helper (same folder):
+
+```powershell
+.\run_lora_sft.ps1 -ModelDir models\base_trained -OutDir models\lora_adapter
+```
+
 Useful options:
 - `--target_modules auto` (default) or manual comma list
 - `--lora_r`, `--lora_alpha`, `--lora_dropout`
