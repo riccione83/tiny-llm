@@ -43,7 +43,8 @@ def main() -> None:
     assistant = GroundedWebAssistant(cfg)
     current_url = args.url.strip()
 
-    print("Mini Assistant ready. Commands: /exit, /url <link>, /clearurl, /showurl")
+    print("Mini Grounded Assistant ready. Commands: /exit, /url <link>, /clearurl, /showurl")
+    print("For plain local chat (no web), use: python -m mini_assistant.direct_chat")
     if current_url:
         print(f"Fixed URL: {current_url}")
 

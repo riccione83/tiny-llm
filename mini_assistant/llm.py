@@ -12,10 +12,12 @@ class HFLocalLLM:
         model_name: str,
         max_new_tokens: int = 160,
         temperature: float = 0.0,
+        use_chat_template: bool = True,
     ) -> None:
         self.model_name = model_name
         self.max_new_tokens = int(max_new_tokens)
         self.temperature = float(temperature)
+        self.use_chat_template = bool(use_chat_template)
         self._tok = None
         self._model = None
         self._device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -57,7 +59,7 @@ class HFLocalLLM:
         self._model.eval()
 
     def _build_prompt(self, messages: List[Dict[str, str]]) -> str:
-        if hasattr(self._tok, "apply_chat_template"):
+        if self.use_chat_template and hasattr(self._tok, "apply_chat_template"):
             return self._tok.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
         out = []
         for m in messages:
@@ -107,6 +109,7 @@ class LocalLLM:
         tiny_tokenizer: str = "tokenizer.model",
         tiny_lora: str = "",
         tiny_top_p: float = 1.0,
+        use_chat_template: bool = True,
     ) -> None:
         b = (backend or "hf").strip().lower()
         if b == "tiny":
@@ -123,6 +126,7 @@ class LocalLLM:
                 model_name=model_name,
                 max_new_tokens=max_new_tokens,
                 temperature=temperature,
+                use_chat_template=bool(use_chat_template),
             )
 
     def generate(self, messages: List[Dict[str, str]]) -> str:
