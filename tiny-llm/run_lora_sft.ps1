@@ -3,9 +3,9 @@ param(
   [string]$OutDir = "models/lora_adapter",
   [string]$Recipe = "heavy",
   [int]$MaxSteps = 12000,
-  [int]$MaxLength = 1024,
-  [int]$BatchSize = 1,
-  [int]$GradAccum = 16
+  [int]$MaxLength = 1280,
+  [int]$BatchSize = 2,
+  [int]$GradAccum = 8
 )
 
 $ErrorActionPreference = "Stop"
@@ -39,6 +39,7 @@ python .\04_train_lora.py `
   --sample_log_steps 200 `
   --sample_log_count 2 `
   --sample_preview_per_source 0 `
-  --sample_eval_prompt "User: Scrivi un messaggio di benvenuto in italiano, amichevole ma professionale.\n\nAssistant:" `
-  --sample_eval_prompt "User: Write a short checklist (5 items) for debugging a Python bug.\n\nAssistant:"
-
+  --sample_eval_prompt "User: Scrivi un messaggio di benvenuto in italiano, amichevole ma professionale.`n`nAssistant:" `
+  --sample_eval_prompt "User: Write a short checklist (5 items) for debugging a Python bug.`n`nAssistant:" `
+  --sample_eval_prompt "User: Risolvi: 18*7. Rispondi con il numero e una breve spiegazione.`n`nAssistant:" `
+  --sample_eval_prompt "User: Se tutti i gatti sono mammiferi e tutti i mammiferi respirano, i gatti respirano? Rispondi si/no e 1 riga.`n`nAssistant:"
