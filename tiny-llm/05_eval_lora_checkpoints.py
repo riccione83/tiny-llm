@@ -82,6 +82,14 @@ def generate_one(model, tokenizer, prompt: str, max_new_tokens: int, temperature
     device = model.device if hasattr(model, "device") else next(model.parameters()).device
     inputs = {k: v.to(device) for k, v in inputs.items()}
     do_sample = temperature > 1e-6
+    if not do_sample:
+        # Avoid spurious warnings on some model generation configs.
+        try:
+            model.generation_config.top_k = None
+            model.generation_config.top_p = None
+            model.generation_config.temperature = None
+        except Exception:
+            pass
     with torch.no_grad():
         out = model.generate(
             **inputs,
@@ -113,6 +121,18 @@ def _is_repetitive(text: str) -> bool:
     return (len(uniq) / max(1, len(chunks))) < 0.55
 
 
+def _has_garbage_pattern(text: str) -> bool:
+    t = (text or "").strip().lower()
+    if not t:
+        return False
+    # Long same-char run or long digit run are strong degeneration signals.
+    if re.search(r"(.)\1{7,}", t):
+        return True
+    if re.search(r"\d{6,}", t):
+        return True
+    return False
+
+
 def _language_score(text: str, expected: str) -> float:
     words = _split_words(text)
     if not words:
@@ -136,6 +156,7 @@ def score_sample(prompt: str, output: str, idx: int) -> Tuple[float, Dict[str, f
     metrics: Dict[str, float] = {
         "non_empty": 1.0 if out else 0.0,
         "not_repetitive": 0.0 if _is_repetitive(out) else 1.0,
+        "no_garbage": 0.0 if _has_garbage_pattern(out) else 1.0,
     }
     if idx == 1:  # Italian welcome
         # prefer 1-3 short sentences, IT language, no aggressive question spam.
@@ -178,6 +199,7 @@ def score_sample(prompt: str, output: str, idx: int) -> Tuple[float, Dict[str, f
         metrics["not_too_long"] = 1.0 if len(words) <= 40 else 0.5
     else:
         metrics["generic_len"] = 1.0 if len(lines) <= 8 else 0.5
+        metrics["generic_not_too_long"] = 1.0 if len(_split_words(out)) <= 120 else 0.5
 
     score = sum(metrics.values()) / max(1, len(metrics))
     return float(score), metrics

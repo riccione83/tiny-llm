@@ -18,6 +18,7 @@ tiny-llm/llm_tokenizer.vocab
 tiny-llm/models/
 
 rag_cache/
+/models/
 # Model checkpoints (large files)
 checkpoints_v3/
 checkpoints_v2/
