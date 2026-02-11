@@ -6,6 +6,8 @@ This folder now uses a strict 4-script workflow:
 2. `02_train_base.py`
 3. `03_download_lora_base.py`
 4. `04_train_lora.py`
+5. `05_eval_lora_checkpoints.py`
+6. `run_lora_sft_quality.ps1` (recommended quality-first run)
 
 Goal: a modern, maintainable pipeline that can run for days and scale quality with bigger data.
 
@@ -97,6 +99,12 @@ PowerShell helper (same folder):
 .\run_lora_sft.ps1 -ModelDir models\base_trained -OutDir models\lora_adapter
 ```
 
+Recommended quality-first helper (2 stages, lower LR, better checkpoint retention):
+
+```powershell
+.\run_lora_sft_quality.ps1 -ModelDir models\base_trained -OutDir models\lora_adapter_v2
+```
+
 Useful options:
 - `--target_modules auto` (default) or manual comma list
 - `--lora_r`, `--lora_alpha`, `--lora_dropout`
@@ -110,6 +118,12 @@ Resume example:
 
 ```powershell
 python .\04_train_lora.py --model_dir models/lora_base --output_dir models/lora_adapter --resume_from_checkpoint models/lora_adapter/checkpoint-900
+```
+
+Evaluate recent LoRA checkpoints during/after training:
+
+```powershell
+python .\05_eval_lora_checkpoints.py --base_model_dir models/base_trained --adapter_dir models/lora_adapter --max_checkpoints 5
 ```
 
 ## Quick Smoke Runs (with built-in samples)
