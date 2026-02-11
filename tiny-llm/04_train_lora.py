@@ -60,6 +60,11 @@ RECIPE_SOURCES: Dict[str, List[HFSource]] = {
     ],
 }
 
+DEFAULT_LOCAL_JSONL_GLOBS: List[str] = [
+    "samples/sft/**/*.jsonl",
+    "tiny-llm/samples/sft/**/*.jsonl",
+]
+
 
 def normalize_text(text: str) -> str:
     t = (text or "").replace("\r\n", "\n").replace("\r", "\n")
@@ -644,7 +649,8 @@ def main() -> None:
     ap.add_argument(
         "--local_jsonl_glob",
         action="append",
-        default=["samples/sft/**/*.jsonl", "tiny-llm/samples/sft/**/*.jsonl"],
+        default=[],
+        help="Local JSONL glob(s). If omitted, defaults to samples/sft globs.",
     )
     ap.add_argument("--disable_local_data", action="store_true")
     ap.add_argument("--max_rows_per_source", type=int, default=0, help="0 = use recipe defaults")
@@ -799,8 +805,9 @@ def main() -> None:
             fn = make_hf_pair_iter(resolved, allow_remote_dataset_code=bool(args.allow_remote_dataset_code))
             sources.append((f"hf:{resolved.name}", fn))
 
+    local_globs = list(args.local_jsonl_glob) if args.local_jsonl_glob else list(DEFAULT_LOCAL_JSONL_GLOBS)
     if not args.disable_local_data:
-        for g in args.local_jsonl_glob:
+        for g in local_globs:
             sources.append((f"local_jsonl:{g}", make_local_jsonl_pair_iter(g)))
 
     if not sources:

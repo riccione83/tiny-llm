@@ -1,6 +1,8 @@
 from typing import Dict, List
 
 import os
+from pathlib import Path
+import json
 import torch
 
 from .tiny_backend import TinyLocalLLM
@@ -37,25 +39,59 @@ class HFLocalLLM:
             return
         from transformers import AutoTokenizer  # type: ignore
         from transformers.utils import logging as hf_logging  # type: ignore
+        from peft import PeftModel  # type: ignore
 
         os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
         os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
         os.environ.setdefault("TRANSFORMERS_NO_ADVISORY_WARNINGS", "1")
         hf_logging.set_verbosity_error()
 
-        self._tok = AutoTokenizer.from_pretrained(self.model_name, use_fast=True)
+        resolved_model_name = self.model_name
+        model_name_path = Path(self.model_name)
+        if not model_name_path.is_absolute() and not model_name_path.exists():
+            alt_path = Path("tiny-llm") / model_name_path
+            if alt_path.exists():
+                resolved_model_name = str(alt_path)
+
+        model_source = resolved_model_name
+        tokenizer_source = resolved_model_name
+        adapter_source = None
+        model_path = Path(resolved_model_name)
+        if (
+            model_path.exists()
+            and model_path.is_dir()
+            and (model_path / "adapter_config.json").exists()
+            and (model_path / "adapter_model.safetensors").exists()
+            and not (model_path / "config.json").exists()
+        ):
+            adapter_source = str(model_path)
+            adapter_cfg = json.loads((model_path / "adapter_config.json").read_text(encoding="utf-8"))
+            base_model = str(adapter_cfg.get("base_model_name_or_path", "")).strip()
+            if not base_model:
+                raise RuntimeError(f"LoRA adapter at {model_path} is missing base_model_name_or_path in adapter_config.json")
+            model_source = base_model
+            if not ((model_path / "tokenizer.json").exists() or (model_path / "tokenizer.model").exists()):
+                tokenizer_source = base_model
+
+        try:
+            self._tok = AutoTokenizer.from_pretrained(tokenizer_source, use_fast=True)
+        except Exception:
+            self._tok = AutoTokenizer.from_pretrained(tokenizer_source, use_fast=False)
+
         dtype = torch.float16 if self._device == "cuda" else torch.float32
         if self._device == "cuda":
             try:
-                self._model = self._from_pretrained_with_dtype(self.model_name, dtype=dtype, device_map="auto")
+                self._model = self._from_pretrained_with_dtype(model_source, dtype=dtype, device_map="auto")
             except ValueError as e:
                 if "requires `accelerate`" not in str(e):
                     raise
-                self._model = self._from_pretrained_with_dtype(self.model_name, dtype=dtype, device_map=None)
+                self._model = self._from_pretrained_with_dtype(model_source, dtype=dtype, device_map=None)
                 self._model.to("cuda")
         else:
-            self._model = self._from_pretrained_with_dtype(self.model_name, dtype=dtype, device_map=None)
+            self._model = self._from_pretrained_with_dtype(model_source, dtype=dtype, device_map=None)
             self._model.to("cpu")
+        if adapter_source:
+            self._model = PeftModel.from_pretrained(self._model, adapter_source)
         self._model.eval()
 
     def _build_prompt(self, messages: List[Dict[str, str]]) -> str:
@@ -63,10 +99,16 @@ class HFLocalLLM:
             return self._tok.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
         out = []
         for m in messages:
-            role = m.get("role", "user").upper()
+            role_raw = m.get("role", "user").strip().lower()
+            if role_raw == "system":
+                role = "System"
+            elif role_raw == "assistant":
+                role = "Assistant"
+            else:
+                role = "User"
             content = m.get("content", "")
             out.append(f"{role}: {content}")
-        out.append("ASSISTANT:")
+        out.append("Assistant:")
         return "\n\n".join(out)
 
     def generate(self, messages: List[Dict[str, str]]) -> str:
