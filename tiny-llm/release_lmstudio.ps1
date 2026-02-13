@@ -286,7 +286,7 @@ try {
   Write-Host "LM Studio model dir: $lmModelDir"
   Write-Host "GGUF: $lmTargetFile"
   Write-Host "Chat template: $chatTemplateFile"
-  Write-Host "LM Studio tip: keep Prompt Template on the model default (or Empty), do not force a foreign template."
+  Write-Host "LM Studio tip: keep Prompt Template on model default/Auto (or ChatML for Qwen-family). Do NOT use Empty and do not force a foreign template."
 } finally {
   Pop-Location
 }

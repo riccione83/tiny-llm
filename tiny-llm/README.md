@@ -2,6 +2,10 @@
 
 This folder contains the full local pipeline to train, repair, evaluate, and ship a GGUF model to LM Studio.
 
+## Additional Runbooks
+
+- `README_3B_RUNBOOK.md`: end-to-end runbook for a 3B base on 16GB VRAM (download, train, resume, eval, release).
+
 ## Install
 
 ```powershell
@@ -67,5 +71,5 @@ python .\regression_suite.py --backend mock
 
 ## LM Studio Notes
 
-- Keep Prompt Template on model default (or `Empty`): do not force a different model template.
+- Keep Prompt Template on model default/`Auto` (or `ChatML` for Qwen-family); do not use `Empty`.
 - For strict-format checks, start with lower randomness (`temperature` ~ `0.2`).

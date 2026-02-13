@@ -7,6 +7,8 @@ param(
   [int]$GradAccum = 8,
   [int]$MaxSteps = 120,
   [double]$LearningRate = 8e-6,
+  [ValidateSet("auto", "float16", "bfloat16", "float32")]
+  [string]$DType = "float16",
   [int]$SaveSteps = 60,
   [int]$SaveTotalLimit = 6,
   [int]$MinLoadedExamples = 250,
@@ -50,6 +52,7 @@ Write-Host "  SeedAdapter  : $SeedAdapter"
 Write-Host "  OutDir       : $OutDir"
 Write-Host "  Shape        : bs=$BatchSize, seq=$MaxLength, accum=$GradAccum"
 Write-Host "  Extra/LR     : extra_steps=$MaxSteps, lr=$LearningRate"
+Write-Host "  DType        : $DType"
 Write-Host "  Data guard   : strict JSONL validation + code-fence hygiene"
 Write-Host ""
 
@@ -96,6 +99,7 @@ $trainArgs = @(
   "--local_jsonl_glob", "samples/sft/format_constraints_strict.jsonl",
   "--local_jsonl_glob", "samples/sft/math_reasoning_micro.jsonl",
   "--max_steps", "$targetMaxSteps",
+  "--dtype", "$DType",
   "--max_length", "$MaxLength",
   "--per_device_batch_size", "$BatchSize",
   "--grad_accum", "$GradAccum",
