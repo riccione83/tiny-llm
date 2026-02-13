@@ -394,12 +394,20 @@ def make_local_jsonl_pair_iter(
     return _iter
 
 
+def pair_signature(prompt: str, answer: str) -> Tuple[str, str]:
+    # Normalize whitespace-only differences so exact duplicate SFT pairs are detectable.
+    p = re.sub(r"\s+", " ", normalize_text_preserve_whitespace(prompt)).strip()
+    a = re.sub(r"\s+", " ", normalize_text_preserve_whitespace(answer)).strip()
+    return (p, a)
+
+
 def build_jsonl_validation_report(
     path: Path,
     prompt_builder: Callable[[List[Dict[str, str]]], str],
     hygiene_cfg: SftHygieneConfig,
 ) -> JsonlFileReport:
     report = JsonlFileReport(path=path)
+    seen_pairs: set[Tuple[str, str]] = set()
     with path.open("r", encoding="utf-8", errors="ignore") as f:
         for line_no, raw_line in enumerate(f, start=1):
             report.total_lines += 1
@@ -418,6 +426,11 @@ def build_jsonl_validation_report(
                     continue
                 h = apply_sft_hygiene(row, answer, hygiene_cfg)
                 if h.keep and h.answer:
+                    sig = pair_signature(prompt, h.answer)
+                    if sig in seen_pairs:
+                        report.duplicate_examples += 1
+                    else:
+                        seen_pairs.add(sig)
                     report.loaded_examples += 1
                 else:
                     report.filtered_examples += 1
@@ -804,6 +817,17 @@ def main() -> None:
         help="Allow training with fewer than --min_loaded_examples after filtering.",
     )
     ap.add_argument(
+        "--fail_on_duplicate_examples",
+        action="store_true",
+        help="Abort when duplicate loaded examples ratio exceeds --max_duplicate_example_ratio.",
+    )
+    ap.add_argument(
+        "--max_duplicate_example_ratio",
+        type=float,
+        default=0.20,
+        help="Max allowed duplicate ratio (duplicate_examples / loaded_examples) when --fail_on_duplicate_examples is set.",
+    )
+    ap.add_argument(
         "--chat_format",
         default="legacy",
         choices=["legacy", "tokenizer", "auto"],
@@ -1002,6 +1026,24 @@ def main() -> None:
                 print(f"- {src_name}: {loaded_per_source[src_name]}")
 
         total_loaded = sum(int(x.loaded_examples) for x in validated_reports)
+        total_duplicates = sum(int(x.duplicate_examples) for x in validated_reports)
+        duplicate_ratio = (float(total_duplicates) / float(total_loaded)) if total_loaded > 0 else 0.0
+        print(
+            "Duplicate loaded examples: "
+            f"{total_duplicates}/{total_loaded} ({duplicate_ratio:.2%})"
+        )
+        if bool(args.fail_on_duplicate_examples) and duplicate_ratio > float(args.max_duplicate_example_ratio):
+            raise SystemExit(
+                f"Aborting: duplicate loaded examples ratio {duplicate_ratio:.2%} exceeds "
+                f"--max_duplicate_example_ratio={float(args.max_duplicate_example_ratio):.2%}."
+            )
+        if total_duplicates > 0 and duplicate_ratio > float(args.max_duplicate_example_ratio):
+            print(
+                "Warning: duplicate loaded examples ratio "
+                f"{duplicate_ratio:.2%} exceeds --max_duplicate_example_ratio="
+                f"{float(args.max_duplicate_example_ratio):.2%}."
+            )
+
         if (total_loaded < int(args.min_loaded_examples)) and (not bool(args.allow_small_dataset)):
             raise SystemExit(
                 f"Aborting: loaded examples after filtering = {total_loaded}, "
@@ -1269,6 +1311,8 @@ def main() -> None:
         "dtype": str(dtype),
         "chat_format": str(effective_chat_format),
         "validate_data": bool(args.validate_data),
+        "fail_on_duplicate_examples": bool(args.fail_on_duplicate_examples),
+        "max_duplicate_example_ratio": float(args.max_duplicate_example_ratio),
         "code_fence_hygiene": str(args.code_fence_hygiene),
         "code_fence_language": str(args.code_fence_language),
         "reject_no_markdown_code_examples": bool(args.reject_no_markdown_code_examples),

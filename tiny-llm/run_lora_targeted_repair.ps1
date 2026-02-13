@@ -8,7 +8,11 @@ param(
   [int]$MaxSteps = 120,
   [double]$LearningRate = 8e-6,
   [int]$SaveSteps = 60,
-  [int]$SaveTotalLimit = 6
+  [int]$SaveTotalLimit = 6,
+  [int]$MinLoadedExamples = 250,
+  [double]$MaxDuplicateExampleRatio = 0.10,
+  [switch]$RepeatSources,
+  [switch]$AllowExistingOutDir
 )
 
 $ErrorActionPreference = "Stop"
@@ -59,41 +63,60 @@ if (-not (Test-Path $ModelDir)) {
 if (-not (Test-Path $SeedAdapter)) {
   throw "Seed adapter checkpoint not found: $SeedAdapter"
 }
+if ((Test-Path $OutDir) -and (-not $AllowExistingOutDir)) {
+  $existingCkpts = @(Get-ChildItem -Path $OutDir -Directory -ErrorAction SilentlyContinue | Where-Object { $_.Name -match '^checkpoint-\d+$' })
+  if ($existingCkpts.Count -gt 0) {
+    throw "Output dir already contains checkpoints: $OutDir. Use a fresh -OutDir or pass -AllowExistingOutDir."
+  }
+}
 
 $resumeStep = Get-CheckpointStep $SeedAdapter
 $targetMaxSteps = [int]$resumeStep + [int]$MaxSteps
 Write-Host "  Resume step  : $resumeStep"
 Write-Host "  Target step  : $targetMaxSteps"
+Write-Host "  Repeat source: $($RepeatSources.IsPresent)"
 Write-Host ""
 
-python .\04_train_lora.py `
-  --model_dir $ModelDir `
-  --output_dir $OutDir `
-  --resume_from_checkpoint $SeedAdapter `
-  --validate_data `
-  --disable_hf_data `
-  --chat_format tokenizer `
-  --code_fence_hygiene normalize `
-  --reject_no_markdown_code_examples `
-  --repeat_sources `
-  --local_jsonl_glob "samples/sft/repair_math_logic_coding.jsonl" `
-  --local_jsonl_glob "samples/sft/system_styles.jsonl" `
-  --local_jsonl_glob "samples/sft/chat_alignment_samples.jsonl" `
-  --local_jsonl_glob "samples/sft/formatting_code_fences.jsonl" `
-  --local_jsonl_glob "samples/sft/format_constraints_strict.jsonl" `
-  --local_jsonl_glob "samples/sft/math_reasoning_micro.jsonl" `
-  --max_steps $targetMaxSteps `
-  --max_length $MaxLength `
-  --per_device_batch_size $BatchSize `
-  --grad_accum $GradAccum `
-  --learning_rate $LearningRate `
-  --warmup_ratio 0.03 `
-  --logging_steps 20 `
-  --save_steps $SaveSteps `
-  --save_total_limit $SaveTotalLimit `
-  --throughput_mode `
-  --disable_sample_logging `
-  --save_merged
+$trainArgs = @(
+  "--model_dir", $ModelDir,
+  "--output_dir", $OutDir,
+  "--resume_from_checkpoint", $SeedAdapter,
+  "--validate_data",
+  "--disable_hf_data",
+  "--chat_format", "tokenizer",
+  "--code_fence_hygiene", "normalize",
+  "--reject_no_markdown_code_examples",
+  "--fail_on_duplicate_examples",
+  "--max_duplicate_example_ratio", "$MaxDuplicateExampleRatio",
+  "--min_loaded_examples", "$MinLoadedExamples",
+  "--local_jsonl_glob", "samples/sft/repair_math_logic_coding.jsonl",
+  "--local_jsonl_glob", "samples/sft/system_styles.jsonl",
+  "--local_jsonl_glob", "samples/sft/chat_alignment_samples.jsonl",
+  "--local_jsonl_glob", "samples/sft/formatting_code_fences.jsonl",
+  "--local_jsonl_glob", "samples/sft/format_constraints_strict.jsonl",
+  "--local_jsonl_glob", "samples/sft/math_reasoning_micro.jsonl",
+  "--max_steps", "$targetMaxSteps",
+  "--max_length", "$MaxLength",
+  "--per_device_batch_size", "$BatchSize",
+  "--grad_accum", "$GradAccum",
+  "--learning_rate", "$LearningRate",
+  "--warmup_ratio", "0.03",
+  "--logging_steps", "20",
+  "--save_steps", "$SaveSteps",
+  "--save_total_limit", "$SaveTotalLimit",
+  "--throughput_mode",
+  "--disable_sample_logging",
+  "--save_merged"
+)
+
+if ($RepeatSources) {
+  $trainArgs += "--repeat_sources"
+}
+
+& python .\04_train_lora.py @trainArgs
+if ($LASTEXITCODE -ne 0) {
+  throw "Targeted repair training failed."
+}
 
 Write-Host ""
 Write-Host "Targeted repair complete."

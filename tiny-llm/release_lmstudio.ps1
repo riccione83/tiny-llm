@@ -218,6 +218,16 @@ try {
     $finalLocalGguf = $quantGguf
   }
 
+  $chatTemplateFile = Join-Path $releaseRoot "chat_template.jinja"
+  Write-Host "Verifying GGUF chat template metadata..."
+  python .\07_verify_gguf_chat_template.py `
+    --gguf $finalLocalGguf `
+    --reference_model_dir $baseModelDirPath `
+    --write_template $chatTemplateFile
+  if ($LASTEXITCODE -ne 0) {
+    throw "GGUF chat template verification failed."
+  }
+
   $publisherDir = Join-Path $LmStudioModelsRoot $LmStudioPublisher
   $lmModelDir = Join-Path $publisherDir $ReleaseName
   New-Item -ItemType Directory -Force -Path $lmModelDir | Out-Null
@@ -244,6 +254,7 @@ try {
     quant_type = $QuantType
     local_gguf = $finalLocalGguf
     lmstudio_gguf = $lmTargetFile
+    chat_template_file = $chatTemplateFile
     created_utc = (Get-Date).ToUniversalTime().ToString("o")
   }
   $info | ConvertTo-Json -Depth 6 | Set-Content -Path (Join-Path $releaseRoot "release_info.json") -Encoding UTF8
@@ -274,6 +285,8 @@ try {
   Write-Host "Release completed."
   Write-Host "LM Studio model dir: $lmModelDir"
   Write-Host "GGUF: $lmTargetFile"
+  Write-Host "Chat template: $chatTemplateFile"
+  Write-Host "LM Studio tip: keep Prompt Template on the model default (or Empty), do not force a foreign template."
 } finally {
   Pop-Location
 }

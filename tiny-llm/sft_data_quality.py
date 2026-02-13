@@ -48,6 +48,7 @@ class JsonlFileReport:
     invalid_lines: int = 0
     loaded_examples: int = 0
     filtered_examples: int = 0
+    duplicate_examples: int = 0
     errors: List[JsonlLineError] = field(default_factory=list)
 
 
@@ -184,7 +185,15 @@ def apply_sft_hygiene(
 
 
 def format_validation_table(reports: Sequence[JsonlFileReport]) -> str:
-    headers = ("file", "total_lines", "valid_lines", "invalid_lines", "loaded_examples")
+    headers = (
+        "file",
+        "total_lines",
+        "valid_lines",
+        "invalid_lines",
+        "loaded_examples",
+        "filtered_examples",
+        "duplicate_examples",
+    )
     rows = [headers]
     for r in reports:
         rows.append(
@@ -194,6 +203,8 @@ def format_validation_table(reports: Sequence[JsonlFileReport]) -> str:
                 str(r.valid_lines),
                 str(r.invalid_lines),
                 str(r.loaded_examples),
+                str(r.filtered_examples),
+                str(r.duplicate_examples),
             )
         )
 

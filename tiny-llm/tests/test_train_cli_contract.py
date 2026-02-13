@@ -15,7 +15,8 @@ class TrainCliContractTests(unittest.TestCase):
 
     def test_targeted_repair_script_passes_multiple_local_globs(self):
         text = Path("tiny-llm/run_lora_targeted_repair.ps1").read_text(encoding="utf-8")
-        hits = re.findall(r'--local_jsonl_glob\s+"[^"]+"', text)
+        # Support both backtick-style CLI invocation and args-array invocation.
+        hits = re.findall(r"--local_jsonl_glob", text)
         self.assertGreaterEqual(
             len(hits),
             2,

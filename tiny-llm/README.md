@@ -41,8 +41,9 @@ python .\05_eval_lora_checkpoints.py --base_model_dir models/base_trained --adap
 
 - `run_lora_targeted_repair.ps1`: conservative targeted repair with strict JSONL validation and code-fence hygiene.
 - `05_eval_lora_checkpoints.py`: scores recent checkpoints on a fixed prompt set.
-- `release_lmstudio.ps1`: selects best checkpoint from eval report (fallback: latest), merges LoRA, converts to GGUF, quantizes, deploys to LM Studio, optional cleanup.
+- `release_lmstudio.ps1`: selects best checkpoint from eval report (fallback: latest), merges LoRA, converts to GGUF, verifies chat-template metadata, quantizes, deploys to LM Studio, optional cleanup.
 - `06_merge_lora_checkpoint.py`: helper used by release script to merge a specific checkpoint into the base model.
+- `07_verify_gguf_chat_template.py`: validates that GGUF includes a non-empty `tokenizer.chat_template` and can compare it with the base tokenizer.
 
 ## Data Safety Defaults
 
@@ -50,6 +51,7 @@ python .\05_eval_lora_checkpoints.py --base_model_dir models/base_trained --adap
 - strict JSONL validation with fail-fast errors (`--validate_data`)
 - append-mode local data globs (`--local_jsonl_glob` repeated)
 - minimum post-filter example guard (`--min_loaded_examples`, override via `--allow_small_dataset`)
+- duplicate example guard (`--fail_on_duplicate_examples`, `--max_duplicate_example_ratio`)
 - code-fence hygiene (`--code_fence_hygiene normalize|reject`)
 - chat format alignment (`--chat_format tokenizer|legacy|auto`)
 
@@ -62,3 +64,8 @@ Targeted format-repair dataset:
 cd tiny-llm
 python .\regression_suite.py --backend mock
 ```
+
+## LM Studio Notes
+
+- Keep Prompt Template on model default (or `Empty`): do not force a different model template.
+- For strict-format checks, start with lower randomness (`temperature` ~ `0.2`).

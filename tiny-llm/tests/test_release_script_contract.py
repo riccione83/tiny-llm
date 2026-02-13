@@ -6,6 +6,7 @@ class ReleaseScriptContractTests(unittest.TestCase):
     def test_release_script_invokes_merge_and_gguf_tools(self):
         text = Path("tiny-llm/release_lmstudio.ps1").read_text(encoding="utf-8")
         self.assertIn("06_merge_lora_checkpoint.py", text)
+        self.assertIn("07_verify_gguf_chat_template.py", text)
         self.assertIn("convert_hf_to_gguf.py", text)
         self.assertIn("llama-quantize.exe", text)
 
@@ -23,4 +24,3 @@ class ReleaseScriptContractTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-
