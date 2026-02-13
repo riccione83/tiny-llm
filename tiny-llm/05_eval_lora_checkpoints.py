@@ -216,6 +216,17 @@ def main() -> None:
     ap.add_argument("--temperature", type=float, default=0.0)
     ap.add_argument("--top_p", type=float, default=0.95)
     ap.add_argument("--dtype", default="auto", choices=["auto", "float16", "bfloat16", "float32"])
+    ap.add_argument(
+        "--device_map",
+        default="auto",
+        choices=["auto", "cuda", "cpu"],
+        help="Model placement mode for eval. Use 'cuda' to force full GPU load when possible.",
+    )
+    ap.add_argument(
+        "--offload_dir",
+        default="",
+        help="Disk offload directory used when device_map='auto' spills layers to CPU/disk.",
+    )
     ap.add_argument("--out_json", default="models/lora_adapter/checkpoint_eval_report.json")
     args = ap.parse_args()
 
@@ -232,6 +243,8 @@ def main() -> None:
     print(f"Loading tokenizer from: {base_model_dir}")
     tokenizer = AutoTokenizer.from_pretrained(str(base_model_dir), use_fast=True)
     dtype = resolve_dtype(args.dtype)
+    offload_dir = Path(args.offload_dir) if str(args.offload_dir).strip() else (adapter_dir / "_eval_offload")
+    offload_dir.mkdir(parents=True, exist_ok=True)
 
     report: Dict[str, object] = {
         "base_model_dir": str(base_model_dir.resolve()),
@@ -244,9 +257,26 @@ def main() -> None:
     for ckpt in checkpoints:
         print(f"\n=== {ckpt.name} ===")
         # Load a fresh base model for each checkpoint to avoid stacking adapters.
-        model = AutoModelForCausalLM.from_pretrained(str(base_model_dir), torch_dtype=dtype, device_map="auto")
+        load_kwargs = {
+            "torch_dtype": dtype,
+        }
+        if str(args.device_map) == "auto":
+            load_kwargs["device_map"] = "auto"
+            load_kwargs["offload_folder"] = str(offload_dir)
+            load_kwargs["offload_state_dict"] = True
+        elif str(args.device_map) == "cpu":
+            load_kwargs["device_map"] = {"": "cpu"}
+        model = AutoModelForCausalLM.from_pretrained(
+            str(base_model_dir),
+            **load_kwargs,
+        )
+        if str(args.device_map) == "cuda":
+            model = model.to("cuda")
         model.eval()
-        peft_model = PeftModel.from_pretrained(model, str(ckpt))
+        peft_kwargs = {}
+        if str(args.device_map) == "auto":
+            peft_kwargs["offload_dir"] = str(offload_dir)
+        peft_model = PeftModel.from_pretrained(model, str(ckpt), **peft_kwargs)
         peft_model.eval()
         rows = []
         sample_scores: List[float] = []

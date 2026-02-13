@@ -99,6 +99,40 @@ def resolve_dtype(name: str) -> torch.dtype:
     raise ValueError(f"Unsupported dtype: {name}")
 
 
+def resolve_4bit_compute_dtype(name: str, fallback: torch.dtype) -> torch.dtype:
+    n = (name or "auto").strip().lower()
+    if n == "auto":
+        if torch.cuda.is_available() and torch.cuda.is_bf16_supported():
+            return torch.bfloat16
+        if torch.cuda.is_available():
+            return torch.float16
+        return fallback
+    if n in {"float16", "fp16"}:
+        return torch.float16
+    if n in {"bfloat16", "bf16"}:
+        return torch.bfloat16
+    if n in {"float32", "fp32"}:
+        return torch.float32
+    raise ValueError(f"Unsupported 4-bit compute dtype: {name}")
+
+
+def prepare_model_for_optional_4bit_training(model, use_gradient_checkpointing: bool):
+    try:
+        from peft import prepare_model_for_kbit_training
+    except Exception as exc:
+        raise RuntimeError(
+            "4-bit quantization requested but this PEFT version has no prepare_model_for_kbit_training. "
+            "Upgrade peft or disable --use_4bit."
+        ) from exc
+    try:
+        return prepare_model_for_kbit_training(
+            model,
+            use_gradient_checkpointing=bool(use_gradient_checkpointing),
+        )
+    except TypeError:
+        return prepare_model_for_kbit_training(model)
+
+
 def resolve_attn_implementation(spec: str) -> Optional[str]:
     name = (spec or "auto").strip().lower()
     if name in {"", "none"}:
@@ -158,22 +192,53 @@ def load_causal_lm(
     dtype: torch.dtype,
     trust_remote_code: bool,
     attn_implementation: str,
+    use_4bit: bool,
+    bnb_4bit_quant_type: str,
+    bnb_4bit_compute_dtype: torch.dtype,
+    bnb_4bit_use_double_quant: bool,
 ):
     kwargs = {"trust_remote_code": bool(trust_remote_code)}
     attn_impl = resolve_attn_implementation(attn_implementation)
     if attn_impl:
         kwargs["attn_implementation"] = attn_impl
+    load_dtype = dtype
+    if bool(use_4bit):
+        if not torch.cuda.is_available():
+            raise RuntimeError("--use_4bit requires CUDA.")
+        try:
+            from transformers import BitsAndBytesConfig
+        except Exception as exc:
+            raise RuntimeError(
+                "4-bit quantization requested but BitsAndBytesConfig is unavailable. "
+                "Upgrade transformers and install bitsandbytes."
+            ) from exc
+        try:
+            import bitsandbytes  # noqa: F401
+        except Exception as exc:
+            raise RuntimeError(
+                "4-bit quantization requested but bitsandbytes is not installed. "
+                "Install bitsandbytes or disable --use_4bit."
+            ) from exc
+        kwargs["quantization_config"] = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_quant_type=str(bnb_4bit_quant_type),
+            bnb_4bit_compute_dtype=bnb_4bit_compute_dtype,
+            bnb_4bit_use_double_quant=bool(bnb_4bit_use_double_quant),
+        )
+        kwargs["device_map"] = "auto"
+        kwargs["low_cpu_mem_usage"] = True
+        load_dtype = bnb_4bit_compute_dtype
     try:
         return AutoModelForCausalLM.from_pretrained(
             model_id_or_path,
-            dtype=dtype,
+            dtype=load_dtype,
             **kwargs,
         )
     except TypeError:
         kwargs.pop("attn_implementation", None)
         return AutoModelForCausalLM.from_pretrained(
             model_id_or_path,
-            torch_dtype=dtype,
+            torch_dtype=load_dtype,
             **kwargs,
         )
 
@@ -917,6 +982,30 @@ def main() -> None:
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--dtype", default="auto", choices=["auto", "float16", "bfloat16", "float32"])
     ap.add_argument(
+        "--use_4bit",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Load the base model in 4-bit (QLoRA). Requires CUDA + bitsandbytes.",
+    )
+    ap.add_argument(
+        "--bnb_4bit_quant_type",
+        default="nf4",
+        choices=["nf4", "fp4"],
+        help="4-bit quantization type when --use_4bit is enabled.",
+    )
+    ap.add_argument(
+        "--bnb_4bit_compute_dtype",
+        default="auto",
+        choices=["auto", "float16", "bfloat16", "float32"],
+        help="Compute dtype for 4-bit training when --use_4bit is enabled.",
+    )
+    ap.add_argument(
+        "--bnb_4bit_use_double_quant",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable double quantization for 4-bit training.",
+    )
+    ap.add_argument(
         "--dataloader_num_workers",
         type=int,
         default=-1,
@@ -1059,12 +1148,32 @@ def main() -> None:
         print("Strict JSONL validation skipped: local data is disabled.")
 
     dtype = resolve_dtype(args.dtype)
+    bnb_compute_dtype = resolve_4bit_compute_dtype(
+        str(args.bnb_4bit_compute_dtype),
+        fallback=dtype,
+    )
+    if bool(args.use_4bit):
+        print(
+            "QLoRA 4-bit enabled: "
+            f"quant={str(args.bnb_4bit_quant_type)}, "
+            f"compute_dtype={str(bnb_compute_dtype)}, "
+            f"double_quant={'on' if bool(args.bnb_4bit_use_double_quant) else 'off'}"
+        )
     model = load_causal_lm(
         model_id_or_path=args.model_dir,
         dtype=dtype,
         trust_remote_code=bool(args.trust_remote_code),
         attn_implementation=str(args.attn_implementation),
+        use_4bit=bool(args.use_4bit),
+        bnb_4bit_quant_type=str(args.bnb_4bit_quant_type),
+        bnb_4bit_compute_dtype=bnb_compute_dtype,
+        bnb_4bit_use_double_quant=bool(args.bnb_4bit_use_double_quant),
     )
+    if bool(args.use_4bit):
+        model = prepare_model_for_optional_4bit_training(
+            model,
+            use_gradient_checkpointing=bool(args.gradient_checkpointing),
+        )
 
     if args.target_modules.strip().lower() == "auto":
         target_modules = detect_target_modules(model)
@@ -1167,8 +1276,9 @@ def main() -> None:
     )
     collator = SFTCollator(pad_token_id=int(tokenizer.pad_token_id))
 
-    use_bf16 = dtype == torch.bfloat16 and torch.cuda.is_available()
-    use_fp16 = dtype == torch.float16 and torch.cuda.is_available()
+    compute_dtype = bnb_compute_dtype if bool(args.use_4bit) else dtype
+    use_bf16 = compute_dtype == torch.bfloat16 and torch.cuda.is_available()
+    use_fp16 = compute_dtype == torch.float16 and torch.cuda.is_available()
     optim_name = resolve_optimizer_name(bool(args.use_fused_optimizer))
     compile_mode = str(args.torch_compile_mode).strip() or "max-autotune"
     compile_backend = resolve_torch_compile_backend(str(args.torch_compile_backend))
@@ -1309,6 +1419,11 @@ def main() -> None:
         "lora_dropout": float(args.lora_dropout),
         "target_modules": target_modules,
         "dtype": str(dtype),
+        "compute_dtype": str(compute_dtype),
+        "use_4bit": bool(args.use_4bit),
+        "bnb_4bit_quant_type": str(args.bnb_4bit_quant_type),
+        "bnb_4bit_compute_dtype": str(bnb_compute_dtype),
+        "bnb_4bit_use_double_quant": bool(args.bnb_4bit_use_double_quant),
         "chat_format": str(effective_chat_format),
         "validate_data": bool(args.validate_data),
         "fail_on_duplicate_examples": bool(args.fail_on_duplicate_examples),

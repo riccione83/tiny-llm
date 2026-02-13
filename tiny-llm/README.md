@@ -5,6 +5,7 @@ This folder contains the full local pipeline to train, repair, evaluate, and shi
 ## Additional Runbooks
 
 - `README_3B_RUNBOOK.md`: end-to-end runbook for a 3B base on 16GB VRAM (download, train, resume, eval, release).
+- `README_ADVANCED_STACK.md`: 7B QLoRA path + RAG memory + local/cloud router runbook.
 
 ## Install
 
@@ -27,6 +28,66 @@ python .\05_eval_lora_checkpoints.py --base_model_dir models/base_trained --adap
 Output in LM Studio:
 - `C:\Users\<you>\.lmstudio\models\<you>\tyny-lm-release2\tyny-lm-release2-q8_0.gguf`
 
+## Recommended 7B Stable Path
+
+For current best quality on this repo, use the 7B path.
+
+Train 7B seed adapter (QLoRA):
+
+```powershell
+cd tiny-llm
+python .\04_train_lora.py `
+  --model_dir models/lora_base_7b `
+  --output_dir models/lora7b_seed_v1 `
+  --disable_hf_data `
+  --validate_data `
+  --chat_format tokenizer `
+  --code_fence_hygiene normalize `
+  --reject_no_markdown_code_examples `
+  --fail_on_duplicate_examples `
+  --max_duplicate_example_ratio 0.10 `
+  --min_loaded_examples 250 `
+  --local_jsonl_glob samples/sft/repair_math_logic_coding.jsonl `
+  --local_jsonl_glob samples/sft/system_styles.jsonl `
+  --local_jsonl_glob samples/sft/chat_alignment_samples.jsonl `
+  --local_jsonl_glob samples/sft/formatting_code_fences.jsonl `
+  --local_jsonl_glob samples/sft/format_constraints_strict.jsonl `
+  --local_jsonl_glob samples/sft/math_reasoning_micro.jsonl `
+  --max_steps 300 `
+  --max_length 1024 `
+  --per_device_batch_size 1 `
+  --grad_accum 16 `
+  --learning_rate 3e-5 `
+  --gradient_checkpointing `
+  --dtype float16 `
+  --use_4bit `
+  --bnb_4bit_quant_type nf4 `
+  --bnb_4bit_compute_dtype float16 `
+  --logging_steps 20 `
+  --save_steps 100 `
+  --save_total_limit 6
+```
+
+Evaluate checkpoints (use CUDA mapping to avoid auto-offload issues on Windows):
+
+```powershell
+cd tiny-llm
+python .\05_eval_lora_checkpoints.py --base_model_dir models/lora_base_7b --adapter_dir models/lora7b_seed_v1 --max_checkpoints 6 --device_map cuda --out_json models/lora7b_seed_v1/checkpoint_eval_report.json
+```
+
+Release to LM Studio (example promoted checkpoint):
+
+```powershell
+cd tiny-llm
+.\release_lmstudio.ps1 `
+  -BaseModelDir models/lora_base_7b `
+  -AdapterDir models/lora7b_seed_v1 `
+  -Checkpoint checkpoint-300 `
+  -EvalReport models/lora7b_seed_v1/checkpoint_eval_report.json `
+  -ReleaseName tyny-lm-7b-release1 `
+  -QuantType Q8_0
+```
+
 ## Cold Start (No Local Artifacts)
 
 Use this when starting from an empty `tiny-llm/models`.
@@ -48,6 +109,7 @@ python .\05_eval_lora_checkpoints.py --base_model_dir models/base_trained --adap
 - `release_lmstudio.ps1`: selects best checkpoint from eval report (fallback: latest), merges LoRA, converts to GGUF, verifies chat-template metadata, quantizes, deploys to LM Studio, optional cleanup.
 - `06_merge_lora_checkpoint.py`: helper used by release script to merge a specific checkpoint into the base model.
 - `07_verify_gguf_chat_template.py`: validates that GGUF includes a non-empty `tokenizer.chat_template` and can compare it with the base tokenizer.
+- `rag_memory_router.py`: lightweight OpenAI-compatible chat gateway with lexical RAG, local memory, and auto local/cloud routing.
 
 ## Data Safety Defaults
 

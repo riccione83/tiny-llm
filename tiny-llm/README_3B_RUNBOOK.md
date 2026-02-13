@@ -2,6 +2,8 @@
 
 Operational runbook to move to a 3B base model with a robust LoRA pipeline (data validation, anti-drift guardrails, evaluation, LM Studio release).
 
+For 7B QLoRA + RAG + router workflow, see `README_ADVANCED_STACK.md`.
+
 ## Goal
 
 - Use a 3B base (`Qwen/Qwen2.5-3B-Instruct`) with the current pipeline.

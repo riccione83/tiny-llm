@@ -9,6 +9,12 @@ param(
   [double]$LearningRate = 8e-6,
   [ValidateSet("auto", "float16", "bfloat16", "float32")]
   [string]$DType = "float16",
+  [switch]$Use4Bit,
+  [ValidateSet("nf4", "fp4")]
+  [string]$Bnb4BitQuantType = "nf4",
+  [ValidateSet("auto", "float16", "bfloat16", "float32")]
+  [string]$Bnb4BitComputeDType = "auto",
+  [switch]$Disable4BitDoubleQuant,
   [int]$SaveSteps = 60,
   [int]$SaveTotalLimit = 6,
   [int]$MinLoadedExamples = 250,
@@ -53,6 +59,10 @@ Write-Host "  OutDir       : $OutDir"
 Write-Host "  Shape        : bs=$BatchSize, seq=$MaxLength, accum=$GradAccum"
 Write-Host "  Extra/LR     : extra_steps=$MaxSteps, lr=$LearningRate"
 Write-Host "  DType        : $DType"
+if ($Use4Bit) {
+  $doubleQuantState = if ($Disable4BitDoubleQuant) { "off" } else { "on" }
+  Write-Host "  QLoRA 4-bit  : quant=$Bnb4BitQuantType, compute_dtype=$Bnb4BitComputeDType, double_quant=$doubleQuantState"
+}
 Write-Host "  Data guard   : strict JSONL validation + code-fence hygiene"
 Write-Host ""
 
@@ -115,6 +125,16 @@ $trainArgs = @(
 
 if ($RepeatSources) {
   $trainArgs += "--repeat_sources"
+}
+if ($Use4Bit) {
+  $trainArgs += @(
+    "--use_4bit",
+    "--bnb_4bit_quant_type", "$Bnb4BitQuantType",
+    "--bnb_4bit_compute_dtype", "$Bnb4BitComputeDType"
+  )
+  if ($Disable4BitDoubleQuant) {
+    $trainArgs += "--no_bnb_4bit_use_double_quant"
+  }
 }
 
 & python .\04_train_lora.py @trainArgs

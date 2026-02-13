@@ -23,6 +23,18 @@ class TrainCliContractTests(unittest.TestCase):
             "run_lora_targeted_repair.ps1 should pass multiple --local_jsonl_glob values",
         )
 
+    def test_train_cli_exposes_optional_qlora_flags(self):
+        text = Path("tiny-llm/04_train_lora.py").read_text(encoding="utf-8")
+        self.assertIn("--use_4bit", text)
+        self.assertIn("--bnb_4bit_quant_type", text)
+        self.assertIn("--bnb_4bit_compute_dtype", text)
+        self.assertIn("--bnb_4bit_use_double_quant", text)
+
+    def test_targeted_repair_script_exposes_optional_qlora_switches(self):
+        text = Path("tiny-llm/run_lora_targeted_repair.ps1").read_text(encoding="utf-8")
+        self.assertIn("$Use4Bit", text)
+        self.assertIn("--use_4bit", text)
+
 
 if __name__ == "__main__":
     unittest.main()
