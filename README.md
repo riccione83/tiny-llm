@@ -8,6 +8,11 @@ This repo supports two official paths:
 Use `mini_assistant/` if you want immediate quality and simpler setup.
 Use `tiny-llm/` if you want to train everything locally from scratch.
 
+## tiny-llm Status
+
+The `tiny-llm` pipeline is now centered on the **7B workflow** (`Qwen/Qwen2.5-7B-Instruct` + LoRA/QLoRA).
+Use `tiny-llm/README.md` for the official minimal 7B runbook.
+
 ## Path A (Recommended): Ready Model + Grounded QA
 
 - LLM: `Qwen/Qwen3-4B-Instruct-2507`
@@ -88,20 +93,20 @@ python -m mini_assistant.eval_confidence_gate --backend hf --model_name Qwen/Qwe
 
 ## What To Ask
 
-Direct answers (no URL needed):
+These prompts are known-good for current setups.
 
-- `Hi`
-- `What is the capital of Italy?`
-- `Reply YES or NO only: Is Berlin in Germany?`
-- `Quanto fa 144/12? Rispondi solo con un numero.`
-
-Web-grounded answers:
+Mini Assistant (`mini_assistant/chat.py`) examples:
 
 - `What is the VRAM of NVIDIA RTX 5070 Ti? Use official sources only.`
 - `What is the latest NVIDIA GPU line?`
-- `Summarize the key points of this page in 3 bullets.` with `/url <page>`
+- `/url https://en.wikipedia.org/wiki/Italy` then ask: `What is the official language?`
+- `/url https://en.wikipedia.org/wiki/Italy` then ask: `Summarize the key points in 3 bullets.`
 
-URL-focused mode:
+tiny-llm 7B (`tyny-lm-7b-release1` in LM Studio) examples:
 
-1. `/url https://en.wikipedia.org/wiki/Italy`
-2. Ask: `What is the official language?`
+- `Write a Python function is_prime(n). Return only a fenced python block.`
+- `Return ONLY valid JSON {"language": string, "has_code": boolean, "code": string}. Task: write add(a,b).`
+- `Give exactly 3 bullets on the risks of fine-tuning with small datasets.`
+- `Compute 47*19. Reply with: "<number>. <one short sentence>".`
+- `Write a TypeScript function quicksort(arr: number[]): number[]. Output only fenced ts.`
+- `Remember this information. My name is Riccardo.` then: `What is my name?`
