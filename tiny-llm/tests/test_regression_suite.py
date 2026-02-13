@@ -13,7 +13,7 @@ from regression_suite import MockGenerator, default_cases, run_suite  # noqa: E4
 class RegressionSuiteTests(unittest.TestCase):
     def test_mock_backend_passes_required_cases(self):
         passed, total, failures = run_suite(MockGenerator(), default_cases())
-        self.assertEqual(total, 4)
+        self.assertGreaterEqual(total, 7)
         self.assertEqual(passed, total)
         self.assertEqual(failures, [])
 

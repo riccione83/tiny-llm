@@ -53,6 +53,9 @@ python .\05_eval_lora_checkpoints.py --base_model_dir models/base_trained --adap
 - code-fence hygiene (`--code_fence_hygiene normalize|reject`)
 - chat format alignment (`--chat_format tokenizer|legacy|auto`)
 
+Targeted format-repair dataset:
+- `samples/sft/format_constraints_strict.jsonl` (fenced python, strict JSON, exact bullets, one-sentence, math format, injection resistance)
+
 ## Quick Regression Check
 
 ```powershell

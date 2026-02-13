@@ -5,9 +5,9 @@ param(
   [int]$MaxLength = 1280,
   [int]$BatchSize = 2,
   [int]$GradAccum = 8,
-  [int]$MaxSteps = 150,
-  [double]$LearningRate = 1e-5,
-  [int]$SaveSteps = 150,
+  [int]$MaxSteps = 120,
+  [double]$LearningRate = 8e-6,
+  [int]$SaveSteps = 60,
   [int]$SaveTotalLimit = 6
 )
 
@@ -80,6 +80,8 @@ python .\04_train_lora.py `
   --local_jsonl_glob "samples/sft/system_styles.jsonl" `
   --local_jsonl_glob "samples/sft/chat_alignment_samples.jsonl" `
   --local_jsonl_glob "samples/sft/formatting_code_fences.jsonl" `
+  --local_jsonl_glob "samples/sft/format_constraints_strict.jsonl" `
+  --local_jsonl_glob "samples/sft/math_reasoning_micro.jsonl" `
   --max_steps $targetMaxSteps `
   --max_length $MaxLength `
   --per_device_batch_size $BatchSize `
