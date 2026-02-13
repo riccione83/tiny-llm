@@ -21,6 +21,15 @@ from typing import Callable, Dict, Iterator, List, Optional, Tuple
 import torch
 from datasets import load_dataset
 from peft import LoraConfig, TaskType, get_peft_model
+from sft_data_quality import (
+    JsonlFileReport,
+    JsonlLineError,
+    SftHygieneConfig,
+    apply_sft_hygiene,
+    format_validation_table,
+    normalize_text_preserve_whitespace,
+    parse_jsonl_object_line,
+)
 from torch.utils.data import IterableDataset
 from transformers import (
     AutoModelForCausalLM,
@@ -196,69 +205,131 @@ def parse_hf_source(spec: str, fallback_max_rows: int) -> HFSource:
     return HFSource(name=name, config=config, split=split, max_rows=max_rows)
 
 
-def pairs_from_messages(messages: object) -> List[Tuple[str, str]]:
+def has_tokenizer_chat_template(tokenizer) -> bool:
+    tpl = getattr(tokenizer, "chat_template", None)
+    return bool(hasattr(tokenizer, "apply_chat_template") and tpl)
+
+
+def resolve_chat_format_mode(requested_mode: str, tokenizer) -> str:
+    mode = (requested_mode or "legacy").strip().lower()
+    if mode not in {"legacy", "tokenizer", "auto"}:
+        raise ValueError(f"Unsupported --chat_format value: {requested_mode}")
+    if mode == "auto":
+        return "tokenizer" if has_tokenizer_chat_template(tokenizer) else "legacy"
+    if mode == "tokenizer" and (not has_tokenizer_chat_template(tokenizer)):
+        raise ValueError("Tokenizer chat template not available; cannot use --chat_format tokenizer")
+    return mode
+
+
+def _legacy_prompt_builder(messages: List[Dict[str, str]]) -> str:
+    lines: List[str] = []
+    for msg in messages:
+        role = str(msg.get("role", "user")).strip().lower()
+        content = normalize_text(str(msg.get("content", "")))
+        if not content:
+            continue
+        prefix = "System" if role == "system" else ("Assistant" if role == "assistant" else "User")
+        lines.append(f"{prefix}: {content}")
+    lines.append("Assistant:")
+    return "\n\n".join(lines)
+
+
+def make_prompt_builder(chat_mode: str, tokenizer) -> Callable[[List[Dict[str, str]]], str]:
+    mode = resolve_chat_format_mode(chat_mode, tokenizer)
+    if mode == "legacy":
+        return _legacy_prompt_builder
+
+    def _tokenizer_prompt_builder(messages: List[Dict[str, str]]) -> str:
+        rendered = tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+        if isinstance(rendered, list):
+            rendered = "".join(str(x) for x in rendered)
+        return normalize_text_preserve_whitespace(str(rendered))
+
+    return _tokenizer_prompt_builder
+
+
+def pairs_from_messages(
+    messages: object,
+    prompt_builder: Callable[[List[Dict[str, str]]], str],
+) -> List[Tuple[str, str]]:
     if not isinstance(messages, list):
         return []
-    cleaned: List[Tuple[str, str]] = []
+    cleaned: List[Dict[str, str]] = []
     for m in messages:
         if not isinstance(m, dict):
             continue
         role = str(m.get("role", "user")).strip().lower()
-        content = normalize_text(str(m.get("content", "")))
-        if not content:
-            continue
         if role not in {"system", "user", "assistant"}:
             role = "user"
-        cleaned.append((role, content))
+        raw_content = str(m.get("content", ""))
+        if role == "assistant":
+            content = normalize_text_preserve_whitespace(raw_content)
+        else:
+            content = normalize_text(raw_content)
+        if not content:
+            continue
+        cleaned.append({"role": role, "content": content})
     if not cleaned:
         return []
 
     pairs: List[Tuple[str, str]] = []
-    history_lines: List[str] = []
-    for role, content in cleaned:
-        if role == "assistant":
-            prompt = "\n\n".join(history_lines + ["Assistant:"])
-            if prompt.strip() and content.strip():
-                pairs.append((prompt, content))
-        prefix = "System" if role == "system" else ("User" if role == "user" else "Assistant")
-        history_lines.append(f"{prefix}: {content}")
+    history: List[Dict[str, str]] = []
+    for msg in cleaned:
+        if msg["role"] == "assistant":
+            prompt = prompt_builder(history)
+            answer = normalize_text_preserve_whitespace(msg["content"])
+            if prompt.strip() and answer:
+                pairs.append((prompt, answer))
+        history.append(msg)
     return pairs
 
 
-def row_to_pairs(row: Dict[str, object]) -> List[Tuple[str, str]]:
-    pairs = pairs_from_messages(row.get("messages"))
+def row_to_pairs(
+    row: Dict[str, object],
+    prompt_builder: Callable[[List[Dict[str, str]]], str],
+) -> List[Tuple[str, str]]:
+    pairs = pairs_from_messages(row.get("messages"), prompt_builder=prompt_builder)
     if pairs:
         return pairs
 
     if isinstance(row.get("question"), str) and isinstance(row.get("response"), str):
+        messages: List[Dict[str, str]] = []
         sys_prompt = normalize_text(str(row.get("system_prompt", "")))
         question = normalize_text(str(row["question"]))
-        answer = normalize_text(str(row["response"]))
-        prompt_parts = []
+        answer = normalize_text_preserve_whitespace(str(row["response"]))
         if sys_prompt:
-            prompt_parts.append(f"System: {sys_prompt}")
-        prompt_parts.append(f"User: {question}")
-        prompt_parts.append("Assistant:")
-        return [("\n\n".join(prompt_parts), answer)]
+            messages.append({"role": "system", "content": sys_prompt})
+        messages.append({"role": "user", "content": question})
+        prompt = prompt_builder(messages)
+        if prompt and answer:
+            return [(prompt, answer)]
+        return []
 
     if isinstance(row.get("instruction"), str):
         instruction = normalize_text(str(row.get("instruction", "")))
         inp = normalize_text(str(row.get("input", "")))
         ctx = normalize_text(str(row.get("context", "")))
-        answer = normalize_text(str(row.get("output", row.get("response", ""))))
+        answer = normalize_text_preserve_whitespace(str(row.get("output", row.get("response", ""))))
         if answer:
             user_text = instruction
             if inp:
                 user_text = f"{user_text}\n\nInput: {inp}"
             if ctx:
                 user_text = f"{user_text}\n\nContext: {ctx}"
-            prompt = f"User: {user_text}\n\nAssistant:"
-            return [(prompt, answer)]
+            prompt = prompt_builder([{"role": "user", "content": user_text}])
+            if prompt:
+                return [(prompt, answer)]
 
     if isinstance(row.get("prompt"), str) and isinstance(row.get("response"), str):
         prompt = normalize_text(str(row["prompt"]))
-        answer = normalize_text(str(row["response"]))
-        return [(f"User: {prompt}\n\nAssistant:", answer)]
+        answer = normalize_text_preserve_whitespace(str(row["response"]))
+        rendered_prompt = prompt_builder([{"role": "user", "content": prompt}])
+        if rendered_prompt and answer:
+            return [(rendered_prompt, answer)]
 
     return []
 
@@ -266,6 +337,8 @@ def row_to_pairs(row: Dict[str, object]) -> List[Tuple[str, str]]:
 def make_hf_pair_iter(
     source: HFSource,
     allow_remote_dataset_code: bool,
+    prompt_builder: Callable[[List[Dict[str, str]]], str],
+    hygiene_cfg: SftHygieneConfig,
 ) -> Callable[[], Iterator[Tuple[str, str]]]:
     def _iter() -> Iterator[Tuple[str, str]]:
         kwargs = {"split": source.split, "streaming": True, "trust_remote_code": allow_remote_dataset_code}
@@ -277,9 +350,12 @@ def make_hf_pair_iter(
         rows = 0
         for row in ds:
             rows += 1
-            for prompt, answer in row_to_pairs(row):
-                if prompt and answer:
-                    yield (prompt, answer)
+            if not isinstance(row, dict):
+                continue
+            for prompt, answer in row_to_pairs(row, prompt_builder=prompt_builder):
+                h = apply_sft_hygiene(row, answer, hygiene_cfg)
+                if prompt and h.keep and h.answer:
+                    yield (prompt, h.answer)
             if source.max_rows > 0 and rows >= source.max_rows:
                 break
 
@@ -288,6 +364,9 @@ def make_hf_pair_iter(
 
 def make_local_jsonl_pair_iter(
     glob_pattern: str,
+    prompt_builder: Callable[[List[Dict[str, str]]], str],
+    hygiene_cfg: SftHygieneConfig,
+    strict_jsonl: bool,
 ) -> Callable[[], Iterator[Tuple[str, str]]]:
     def _iter() -> Iterator[Tuple[str, str]]:
         for p in sorted(Path(".").glob(glob_pattern)):
@@ -295,23 +374,76 @@ def make_local_jsonl_pair_iter(
                 continue
             try:
                 with p.open("r", encoding="utf-8", errors="ignore") as f:
-                    for line in f:
-                        line = line.strip()
-                        if not line:
+                    for line_no, raw_line in enumerate(f, start=1):
+                        row, err = parse_jsonl_object_line(raw_line)
+                        if err:
+                            if strict_jsonl:
+                                raise ValueError(f"{p}:{line_no}: {err}")
                             continue
-                        try:
-                            row = json.loads(line)
-                        except Exception:
+                        if row is None:
                             continue
-                        if not isinstance(row, dict):
-                            continue
-                        for prompt, answer in row_to_pairs(row):
-                            if prompt and answer:
-                                yield (prompt, answer)
+                        for prompt, answer in row_to_pairs(row, prompt_builder=prompt_builder):
+                            h = apply_sft_hygiene(row, answer, hygiene_cfg)
+                            if prompt and h.keep and h.answer:
+                                yield (prompt, h.answer)
             except Exception:
+                if strict_jsonl:
+                    raise
                 continue
 
     return _iter
+
+
+def build_jsonl_validation_report(
+    path: Path,
+    prompt_builder: Callable[[List[Dict[str, str]]], str],
+    hygiene_cfg: SftHygieneConfig,
+) -> JsonlFileReport:
+    report = JsonlFileReport(path=path)
+    with path.open("r", encoding="utf-8", errors="ignore") as f:
+        for line_no, raw_line in enumerate(f, start=1):
+            report.total_lines += 1
+            row, err = parse_jsonl_object_line(raw_line)
+            if err:
+                report.invalid_lines += 1
+                report.errors.append(JsonlLineError(line_no=line_no, message=err))
+                continue
+
+            report.valid_lines += 1
+            if row is None:
+                continue
+
+            for prompt, answer in row_to_pairs(row, prompt_builder=prompt_builder):
+                if not prompt or not answer:
+                    continue
+                h = apply_sft_hygiene(row, answer, hygiene_cfg)
+                if h.keep and h.answer:
+                    report.loaded_examples += 1
+                else:
+                    report.filtered_examples += 1
+    return report
+
+
+def validate_local_jsonl_sources(
+    globs: List[str],
+    prompt_builder: Callable[[List[Dict[str, str]]], str],
+    hygiene_cfg: SftHygieneConfig,
+) -> Tuple[List[JsonlFileReport], Dict[str, int]]:
+    reports: List[JsonlFileReport] = []
+    loaded_per_source: Dict[str, int] = {}
+    for g in globs:
+        src_name = f"local_jsonl:{g}"
+        loaded_per_source[src_name] = 0
+        files = [p for p in sorted(Path(".").glob(g)) if p.is_file()]
+        for p in files:
+            rep = build_jsonl_validation_report(
+                path=p,
+                prompt_builder=prompt_builder,
+                hygiene_cfg=hygiene_cfg,
+            )
+            reports.append(rep)
+            loaded_per_source[src_name] += int(rep.loaded_examples)
+    return reports, loaded_per_source
 
 
 def make_round_robin_pair_iter(
@@ -372,7 +504,7 @@ class SFTIterableDataset(IterableDataset):
         eos = self.tokenizer.eos_token_id
         for prompt, answer in self.pair_iter_factory():
             prompt = normalize_text(prompt)
-            answer = normalize_text(answer)
+            answer = normalize_text_preserve_whitespace(answer)
             if not prompt or not answer:
                 continue
 
@@ -655,6 +787,45 @@ def main() -> None:
     ap.add_argument("--disable_local_data", action="store_true")
     ap.add_argument("--max_rows_per_source", type=int, default=0, help="0 = use recipe defaults")
     ap.add_argument("--repeat_sources", action="store_true")
+    ap.add_argument(
+        "--validate_data",
+        action="store_true",
+        help="Strictly validate local JSONL before training and fail on malformed lines.",
+    )
+    ap.add_argument(
+        "--min_loaded_examples",
+        type=int,
+        default=200,
+        help="Minimum loaded examples required when --validate_data is enabled.",
+    )
+    ap.add_argument(
+        "--allow_small_dataset",
+        action="store_true",
+        help="Allow training with fewer than --min_loaded_examples after filtering.",
+    )
+    ap.add_argument(
+        "--chat_format",
+        default="legacy",
+        choices=["legacy", "tokenizer", "auto"],
+        help="Prompt format used to build SFT prompts from role messages.",
+    )
+    ap.add_argument(
+        "--code_fence_hygiene",
+        default="off",
+        choices=["off", "reject", "normalize"],
+        help="Code-fence hygiene for Python-like assistant outputs in SFT data.",
+    )
+    ap.add_argument(
+        "--code_fence_language",
+        default="python",
+        help="Language tag used when --code_fence_hygiene normalize wraps code blocks.",
+    )
+    ap.add_argument(
+        "--reject_no_markdown_code_examples",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Reject code-like examples whose system/user prompt asks for no markdown.",
+    )
 
     ap.add_argument("--max_length", type=int, default=1024)
     ap.add_argument("--min_answer_tokens", type=int, default=4)
@@ -721,6 +892,23 @@ def main() -> None:
     )
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--dtype", default="auto", choices=["auto", "float16", "bfloat16", "float32"])
+    ap.add_argument(
+        "--dataloader_num_workers",
+        type=int,
+        default=-1,
+        help="DataLoader workers (-1 auto: 2 on CUDA, else 0). Increase if GPU is underutilized.",
+    )
+    ap.add_argument(
+        "--dataloader_prefetch_factor",
+        type=int,
+        default=2,
+        help="DataLoader prefetch factor (used only when workers > 0).",
+    )
+    ap.add_argument(
+        "--dataloader_persistent_workers",
+        action="store_true",
+        help="Keep DataLoader workers alive between steps when workers > 0.",
+    )
     ap.add_argument("--gradient_checkpointing", action="store_true")
     ap.add_argument("--trust_remote_code", action="store_true")
     ap.add_argument("--resume_from_checkpoint", default="")
@@ -746,6 +934,12 @@ def main() -> None:
     out = Path(args.output_dir)
     out.mkdir(parents=True, exist_ok=True)
     configure_torch_runtime(bool(args.tf32))
+    local_globs = list(args.local_jsonl_glob) if args.local_jsonl_glob else list(DEFAULT_LOCAL_JSONL_GLOBS)
+    hygiene_cfg = SftHygieneConfig(
+        code_fence_mode=str(args.code_fence_hygiene),
+        fence_language=str(args.code_fence_language),
+        reject_no_markdown_code_instructions=bool(args.reject_no_markdown_code_examples),
+    )
 
     tokenizer = AutoTokenizer.from_pretrained(
         args.model_dir,
@@ -760,6 +954,67 @@ def main() -> None:
         else:
             print("Warning: tokenizer has no pad_token_id/eos_token_id; defaulting pad_token_id=0")
             tokenizer.pad_token_id = 0
+    prompt_builder = make_prompt_builder(chat_mode=str(args.chat_format), tokenizer=tokenizer)
+    effective_chat_format = resolve_chat_format_mode(str(args.chat_format), tokenizer=tokenizer)
+    print(f"Chat format: {effective_chat_format}")
+    if effective_chat_format == "legacy" and has_tokenizer_chat_template(tokenizer):
+        print(
+            "Warning: tokenizer chat template is available but disabled; "
+            "this can cause train/inference format mismatch."
+        )
+
+    if args.local_jsonl_glob:
+        print(
+            f"Local JSONL globs (append mode, {len(args.local_jsonl_glob)} values): "
+            + ", ".join(args.local_jsonl_glob)
+        )
+
+    validated_reports: List[JsonlFileReport] = []
+    loaded_per_source: Dict[str, int] = {}
+    if bool(args.validate_data) and (not bool(args.disable_local_data)):
+        validated_reports, loaded_per_source = validate_local_jsonl_sources(
+            globs=local_globs,
+            prompt_builder=prompt_builder,
+            hygiene_cfg=hygiene_cfg,
+        )
+        if validated_reports:
+            print("")
+            print("Strict JSONL validation summary")
+            print(format_validation_table(validated_reports))
+        else:
+            print("Strict JSONL validation: no local files matched configured globs.")
+
+        all_errors: List[Tuple[Path, JsonlLineError]] = []
+        for rep in validated_reports:
+            for err in rep.errors:
+                all_errors.append((rep.path, err))
+        if all_errors:
+            print("")
+            print("Validation errors:")
+            for p, err in all_errors:
+                print(f"- {p}:{err.line_no}: {err.message}")
+            raise SystemExit("Aborting: strict JSONL validation failed.")
+
+        if loaded_per_source:
+            print("")
+            print("Loaded examples per local source (after hygiene):")
+            for src_name in sorted(loaded_per_source.keys()):
+                print(f"- {src_name}: {loaded_per_source[src_name]}")
+
+        total_loaded = sum(int(x.loaded_examples) for x in validated_reports)
+        if (total_loaded < int(args.min_loaded_examples)) and (not bool(args.allow_small_dataset)):
+            raise SystemExit(
+                f"Aborting: loaded examples after filtering = {total_loaded}, "
+                f"below --min_loaded_examples={int(args.min_loaded_examples)}. "
+                "Use --allow_small_dataset to override."
+            )
+        if total_loaded < int(args.min_loaded_examples):
+            print(
+                f"Warning: loaded examples after filtering ({total_loaded}) are below "
+                f"--min_loaded_examples={int(args.min_loaded_examples)} (override accepted)."
+            )
+    elif bool(args.validate_data):
+        print("Strict JSONL validation skipped: local data is disabled.")
 
     dtype = resolve_dtype(args.dtype)
     model = load_causal_lm(
@@ -797,18 +1052,37 @@ def main() -> None:
         for src in RECIPE_SOURCES[args.recipe]:
             max_rows = int(args.max_rows_per_source) if int(args.max_rows_per_source) > 0 else int(src.max_rows)
             resolved = HFSource(src.name, src.config, src.split, max_rows)
-            fn = make_hf_pair_iter(resolved, allow_remote_dataset_code=bool(args.allow_remote_dataset_code))
+            fn = make_hf_pair_iter(
+                resolved,
+                allow_remote_dataset_code=bool(args.allow_remote_dataset_code),
+                prompt_builder=prompt_builder,
+                hygiene_cfg=hygiene_cfg,
+            )
             sources.append((f"hf:{resolved.name}", fn))
 
         for spec in args.hf_source:
             resolved = parse_hf_source(spec, fallback_max_rows=int(args.max_rows_per_source))
-            fn = make_hf_pair_iter(resolved, allow_remote_dataset_code=bool(args.allow_remote_dataset_code))
+            fn = make_hf_pair_iter(
+                resolved,
+                allow_remote_dataset_code=bool(args.allow_remote_dataset_code),
+                prompt_builder=prompt_builder,
+                hygiene_cfg=hygiene_cfg,
+            )
             sources.append((f"hf:{resolved.name}", fn))
 
-    local_globs = list(args.local_jsonl_glob) if args.local_jsonl_glob else list(DEFAULT_LOCAL_JSONL_GLOBS)
     if not args.disable_local_data:
         for g in local_globs:
-            sources.append((f"local_jsonl:{g}", make_local_jsonl_pair_iter(g)))
+            sources.append(
+                (
+                    f"local_jsonl:{g}",
+                    make_local_jsonl_pair_iter(
+                        g,
+                        prompt_builder=prompt_builder,
+                        hygiene_cfg=hygiene_cfg,
+                        strict_jsonl=bool(args.validate_data),
+                    ),
+                )
+            )
 
     if not sources:
         raise SystemExit("No LoRA training sources found.")
@@ -856,6 +1130,21 @@ def main() -> None:
     optim_name = resolve_optimizer_name(bool(args.use_fused_optimizer))
     compile_mode = str(args.torch_compile_mode).strip() or "max-autotune"
     compile_backend = resolve_torch_compile_backend(str(args.torch_compile_backend))
+    if int(args.dataloader_num_workers) < 0:
+        dataloader_num_workers = 2 if torch.cuda.is_available() else 0
+    else:
+        dataloader_num_workers = int(args.dataloader_num_workers)
+    # NOTE: this training pipeline builds iterable factories with local callables.
+    # On Windows, DataLoader multiprocessing requires picklable worker state and
+    # fails with "Can't pickle local object ...". Force single-process loading.
+    if platform.system().lower().startswith("win") and dataloader_num_workers > 0:
+        print(
+            "DataLoader workers > 0 are not supported on Windows with this IterableDataset "
+            "(non-picklable local iter factory). Falling back to dataloader_num_workers=0."
+        )
+        dataloader_num_workers = 0
+    dataloader_persistent_workers = bool(args.dataloader_persistent_workers) and dataloader_num_workers > 0
+    dataloader_prefetch_factor = int(args.dataloader_prefetch_factor) if dataloader_num_workers > 0 else None
 
     print(
         "Runtime config: "
@@ -883,8 +1172,10 @@ def main() -> None:
         fp16=bool(use_fp16),
         report_to=[],
         remove_unused_columns=False,
-        dataloader_num_workers=0,
+        dataloader_num_workers=dataloader_num_workers,
         dataloader_pin_memory=torch.cuda.is_available(),
+        dataloader_prefetch_factor=dataloader_prefetch_factor,
+        dataloader_persistent_workers=dataloader_persistent_workers,
         optim=optim_name,
         save_safetensors=True,
         gradient_checkpointing=bool(args.gradient_checkpointing),
@@ -976,6 +1267,14 @@ def main() -> None:
         "lora_dropout": float(args.lora_dropout),
         "target_modules": target_modules,
         "dtype": str(dtype),
+        "chat_format": str(effective_chat_format),
+        "validate_data": bool(args.validate_data),
+        "code_fence_hygiene": str(args.code_fence_hygiene),
+        "code_fence_language": str(args.code_fence_language),
+        "reject_no_markdown_code_examples": bool(args.reject_no_markdown_code_examples),
+        "dataloader_num_workers": int(dataloader_num_workers),
+        "dataloader_prefetch_factor": int(args.dataloader_prefetch_factor),
+        "dataloader_persistent_workers": bool(dataloader_persistent_workers),
     }
     (out / "lora_training_config.json").write_text(json.dumps(run_meta, indent=2), encoding="utf-8")
 

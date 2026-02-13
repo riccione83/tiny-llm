@@ -5,9 +5,9 @@ param(
   [int]$MaxLength = 1280,
   [int]$BatchSize = 2,
   [int]$GradAccum = 8,
-  [int]$MaxSteps = 1400,
-  [double]$LearningRate = 6e-5,
-  [int]$SaveSteps = 200,
+  [int]$MaxSteps = 150,
+  [double]$LearningRate = 1e-5,
+  [int]$SaveSteps = 150,
   [int]$SaveTotalLimit = 6
 )
 
@@ -46,6 +46,7 @@ Write-Host "  SeedAdapter  : $SeedAdapter"
 Write-Host "  OutDir       : $OutDir"
 Write-Host "  Shape        : bs=$BatchSize, seq=$MaxLength, accum=$GradAccum"
 Write-Host "  Extra/LR     : extra_steps=$MaxSteps, lr=$LearningRate"
+Write-Host "  Data guard   : strict JSONL validation + code-fence hygiene"
 Write-Host ""
 
 $ModelDir = Resolve-LocalPath $ModelDir
@@ -69,11 +70,16 @@ python .\04_train_lora.py `
   --model_dir $ModelDir `
   --output_dir $OutDir `
   --resume_from_checkpoint $SeedAdapter `
+  --validate_data `
   --disable_hf_data `
+  --chat_format tokenizer `
+  --code_fence_hygiene normalize `
+  --reject_no_markdown_code_examples `
   --repeat_sources `
   --local_jsonl_glob "samples/sft/repair_math_logic_coding.jsonl" `
   --local_jsonl_glob "samples/sft/system_styles.jsonl" `
   --local_jsonl_glob "samples/sft/chat_alignment_samples.jsonl" `
+  --local_jsonl_glob "samples/sft/formatting_code_fences.jsonl" `
   --max_steps $targetMaxSteps `
   --max_length $MaxLength `
   --per_device_batch_size $BatchSize `

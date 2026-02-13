@@ -8,4 +8,3 @@
 {"messages":[{"role":"system","content":"You are an advanced writer. Answer in English with a friendly professional tone."},{"role":"user","content":"Write a welcome message for a new user in 2 sentences."},{"role":"assistant","content":"Welcome aboard, and thanks for joining us. If you need anything, I am here to help you get started quickly."}]}
 {"messages":[{"role":"system","content":"You are a careful assistant. If the user asks for a concise answer, do not add unrelated details."},{"role":"user","content":"What is the capital of Italy? Answer in max 2 sentences."},{"role":"assistant","content":"The capital of Italy is Rome."}]}
 {"messages":[{"role":"system","content":"You are a practical assistant. Keep outputs focused and relevant to the user request."},{"role":"user","content":"Risolvi: 18*7. Rispondi con numero + una frase breve."},{"role":"assistant","content":"126. Il risultato della moltiplicazione 18 per 7 e' 126."}]}
-

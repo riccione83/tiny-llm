@@ -16,6 +16,7 @@ tiny-llm/fast_gpt_v3_best.pt
 tiny-llm/llm_tokenizer.model
 tiny-llm/llm_tokenizer.vocab
 tiny-llm/models/
+tiny-llm/tools/
 
 rag_cache/
 /models/

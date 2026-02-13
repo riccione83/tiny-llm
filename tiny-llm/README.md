@@ -1,21 +1,6 @@
-# tiny-llm (Modern Minimal Pipeline)
+# tiny-llm (Training + Repair + LM Studio Release)
 
-This folder now uses a strict 4-script workflow:
-
-1. `01_download_base.py`
-2. `02_train_base.py`
-3. `03_download_lora_base.py`
-4. `04_train_lora.py`
-5. `05_eval_lora_checkpoints.py`
-6. `run_lora_sft_quality.ps1` (recommended quality-first run)
-
-Goal: a modern, maintainable pipeline that can run for days and scale quality with bigger data.
-
-Included local samples:
-- Base training: `samples/base/*.txt` and `samples/base/*.jsonl`
-- LoRA training: `samples/sft/*.jsonl`
-
-These are already loaded by default by `02_train_base.py` and `04_train_lora.py`.
+This folder contains the full local pipeline to train, repair, evaluate, and ship a GGUF model to LM Studio.
 
 ## Install
 
@@ -24,127 +9,53 @@ python -m pip install -U pip
 python -m pip install -r ..\requirements.txt
 ```
 
-## 1) Download Base Model (full-training path)
+## Minimal Runbook (Existing Base + Seed Adapter)
+
+Use this when you already have `models/base_trained` and a seed adapter checkpoint.
+
+```powershell
+cd tiny-llm
+.\run_lora_targeted_repair.ps1 -ModelDir models/base_trained -SeedAdapter models/lora_repair_v1/checkpoint-900 -OutDir models/lora_repair_v2
+python .\05_eval_lora_checkpoints.py --base_model_dir models/base_trained --adapter_dir models/lora_repair_v2 --max_checkpoints 6 --out_json models/lora_repair_v2/checkpoint_eval_report.json
+.\release_lmstudio.ps1 -BaseModelDir models/base_trained -AdapterDir models/lora_repair_v2 -ReleaseName tyny-lm-release2 -CleanupOldCheckpoints -CleanupOldLmStudioModels
+```
+
+Output in LM Studio:
+- `C:\Users\<you>\.lmstudio\models\<you>\tyny-lm-release2\tyny-lm-release2-q8_0.gguf`
+
+## Cold Start (No Local Artifacts)
+
+Use this when starting from an empty `tiny-llm/models`.
 
 ```powershell
 cd tiny-llm
 python .\01_download_base.py --model_id Qwen/Qwen2.5-0.5B-Instruct --output_dir models/base
-```
-
-Notes:
-- `0.5B` is a practical default for full fine-tuning.
-- Change `--model_id` if you have more VRAM.
-
-## 2) Train Base Model (knowledge-first)
-
-```powershell
 python .\02_train_base.py --model_dir models/base --output_dir models/base_trained --recipe knowledge-heavy --max_steps 30000 --repeat_sources --gradient_checkpointing
+.\run_lora_sft_quality.ps1 -ModelDir models/base_trained -OutDir models/lora_repair_v1
+.\run_lora_targeted_repair.ps1 -ModelDir models/base_trained -SeedAdapter models/lora_repair_v1/checkpoint-900 -OutDir models/lora_repair_v2
+python .\05_eval_lora_checkpoints.py --base_model_dir models/base_trained --adapter_dir models/lora_repair_v2 --max_checkpoints 6 --out_json models/lora_repair_v2/checkpoint_eval_report.json
+.\release_lmstudio.ps1 -BaseModelDir models/base_trained -AdapterDir models/lora_repair_v2 -ReleaseName tyny-lm-release2 -CleanupOldCheckpoints -CleanupOldLmStudioModels
 ```
 
-What this script does:
-- Streams large corpora (FineWeb-EDU + C4 + FineWeb, recipe dependent).
-- Packs tokens into fixed blocks for efficient causal LM training.
-- Supports long multi-day runs using `--max_steps`.
-- Saves periodic checkpoints every `--save_steps`.
-- On `Ctrl+C`, saves an emergency checkpoint before exit.
-- Includes local curated samples by default.
-- Prints preview samples during training every `200` steps by default.
+## Automation Scripts
 
-Useful options:
-- `--recipe tiny|standard|knowledge-heavy`
-- `--max_steps 100000` for long training
-- `--hf_source "dataset|config|split|text_field|max_texts"` to add more sources
-- `--disable_hf_data` to train only on local samples/custom files
-- `--resume_from_checkpoint <path>`
-- `--sample_log_steps 200` and `--sample_log_count 2`
-- `--disable_sample_logging` to turn preview printing off
+- `run_lora_targeted_repair.ps1`: conservative targeted repair with strict JSONL validation and code-fence hygiene.
+- `05_eval_lora_checkpoints.py`: scores recent checkpoints on a fixed prompt set.
+- `release_lmstudio.ps1`: selects best checkpoint from eval report (fallback: latest), merges LoRA, converts to GGUF, quantizes, deploys to LM Studio, optional cleanup.
+- `06_merge_lora_checkpoint.py`: helper used by release script to merge a specific checkpoint into the base model.
 
-Resume example:
+## Data Safety Defaults
+
+`04_train_lora.py` now supports:
+- strict JSONL validation with fail-fast errors (`--validate_data`)
+- append-mode local data globs (`--local_jsonl_glob` repeated)
+- minimum post-filter example guard (`--min_loaded_examples`, override via `--allow_small_dataset`)
+- code-fence hygiene (`--code_fence_hygiene normalize|reject`)
+- chat format alignment (`--chat_format tokenizer|legacy|auto`)
+
+## Quick Regression Check
 
 ```powershell
-python .\02_train_base.py --model_dir models/base --output_dir models/base_trained --resume_from_checkpoint models/base_trained/checkpoint-1500
+cd tiny-llm
+python .\regression_suite.py --backend mock
 ```
-
-## 3) Download LoRA Base (alignment path)
-
-```powershell
-python .\03_download_lora_base.py --model_id Qwen/Qwen3-4B-Instruct-2507 --output_dir models/lora_base
-```
-
-Why separate:
-- For best chat quality, LoRA often benefits from a stronger instruct base than full-training default.
-
-## 4) Train LoRA Adapter (instruction/chat)
-
-```powershell
-python .\04_train_lora.py --model_dir models/lora_base --output_dir models/lora_adapter --recipe heavy --max_steps 8000 --repeat_sources --gradient_checkpointing --save_merged
-```
-
-What this script does:
-- Trains PEFT LoRA on instruction/chat datasets (UltraChat, OpenOrca, Alpaca, Dolly by recipe).
-- Uses completion-only labels (prompt tokens masked with `-100`).
-- Saves adapter and optional merged model.
-- Saves periodic checkpoints every `--save_steps`.
-- On `Ctrl+C`, saves an emergency checkpoint before exit.
-- Includes local curated SFT samples by default.
-- Prints preview prompt/answer samples during training every `200` steps by default.
-
-Local SFT examples live in `samples/sft/*.jsonl`. If you want the model to follow
-your own fixed prompt format (System + User), add examples there. A starter
-file is provided: `samples/sft/system_styles.jsonl`.
-
-PowerShell helper (same folder):
-
-```powershell
-.\run_lora_sft.ps1 -ModelDir models\base_trained -OutDir models\lora_adapter
-```
-
-Recommended quality-first helper (2 stages, lower LR, better checkpoint retention):
-
-```powershell
-.\run_lora_sft_quality.ps1 -ModelDir models\base_trained -OutDir models\lora_adapter_v2
-```
-
-Useful options:
-- `--target_modules auto` (default) or manual comma list
-- `--lora_r`, `--lora_alpha`, `--lora_dropout`
-- `--hf_source "dataset|config|split|max_rows"` to add more SFT data
-- `--disable_hf_data` to train only on local SFT JSONL
-- `--resume_from_checkpoint <path>`
-- `--sample_log_steps 200` and `--sample_log_count 2`
-- `--disable_sample_logging` to turn preview printing off
-
-Resume example:
-
-```powershell
-python .\04_train_lora.py --model_dir models/lora_base --output_dir models/lora_adapter --resume_from_checkpoint models/lora_adapter/checkpoint-900
-```
-
-Evaluate recent LoRA checkpoints during/after training:
-
-```powershell
-python .\05_eval_lora_checkpoints.py --base_model_dir models/base_trained --adapter_dir models/lora_adapter --max_checkpoints 5
-```
-
-## Quick Smoke Runs (with built-in samples)
-
-```powershell
-python .\02_train_base.py --model_dir models/base --output_dir models/base_trained --disable_hf_data --max_steps 300 --save_steps 100 --gradient_checkpointing
-python .\04_train_lora.py --model_dir models/lora_base --output_dir models/lora_adapter --disable_hf_data --max_steps 400 --save_steps 100 --gradient_checkpointing
-```
-
-## Quality Guidance
-
-- For stronger knowledge:
-  - prioritize `02_train_base.py` with `--recipe knowledge-heavy`
-  - run higher `--max_steps` (tens of thousands to hundreds of thousands)
-- For better instruction behavior:
-  - follow with `04_train_lora.py` on `--recipe standard` or `heavy`
-- For best results, monitor loss and periodically evaluate with a fixed benchmark set.
-
-## Output Layout
-
-- `models/base`              downloaded base for full training
-- `models/base_trained`      continued-pretrained model
-- `models/lora_base`         downloaded base for LoRA
-- `models/lora_adapter`      LoRA adapter (+ optional merged model)

@@ -52,6 +52,15 @@ python .\03_download_lora_base.py --model_id Qwen/Qwen3-4B-Instruct-2507 --outpu
 python .\04_train_lora.py --model_dir models/lora_base --output_dir models/lora_adapter --recipe heavy --max_steps 8000 --repeat_sources --gradient_checkpointing --save_merged
 ```
 
+Production repair/release path (LM Studio ready):
+
+```powershell
+cd tiny-llm
+.\run_lora_targeted_repair.ps1 -ModelDir models/base_trained -SeedAdapter models/lora_repair_v1/checkpoint-900 -OutDir models/lora_repair_v2
+python .\05_eval_lora_checkpoints.py --base_model_dir models/base_trained --adapter_dir models/lora_repair_v2 --max_checkpoints 6 --out_json models/lora_repair_v2/checkpoint_eval_report.json
+.\release_lmstudio.ps1 -BaseModelDir models/base_trained -AdapterDir models/lora_repair_v2 -ReleaseName tyny-lm-release2 -CleanupOldCheckpoints -CleanupOldLmStudioModels
+```
+
 Full details and options: `tiny-llm/README.md`.
 Built-in local samples are in `tiny-llm/samples/` and are loaded by default in both training scripts.
 
