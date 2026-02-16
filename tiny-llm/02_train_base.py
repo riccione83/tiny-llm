@@ -1020,6 +1020,19 @@ def main() -> None:
 
     use_bf16 = dtype == torch.bfloat16 and torch.cuda.is_available()
     use_fp16 = dtype == torch.float16 and torch.cuda.is_available()
+    # If model params are already in fp16, GradScaler unscale can fail on some torch/accelerate versions.
+    # In that case, keep fp16 weights but disable Trainer fp16 AMP path.
+    if use_fp16:
+        try:
+            first_param_dtype = next(model.parameters()).dtype
+            if first_param_dtype == torch.float16:
+                print(
+                    "Detected fp16 model parameters at load time; "
+                    "disabling Trainer fp16 AMP unscale path for compatibility."
+                )
+                use_fp16 = False
+        except Exception:
+            pass
     optim_name = resolve_optimizer_name(bool(args.use_fused_optimizer))
     compile_mode = str(args.torch_compile_mode).strip() or "max-autotune"
     compile_backend = resolve_torch_compile_backend(str(args.torch_compile_backend))

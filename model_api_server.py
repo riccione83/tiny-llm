@@ -46,6 +46,36 @@ def _latest_checkpoint(adapter_root: Path) -> Optional[Path]:
     return ckpts[-1]
 
 
+def _recommended_max_3b_adapter() -> Optional[Path]:
+    summary = ROOT / "tiny-llm" / "models" / "base_3b_code_max_16gb_v1" / "code_assistant_max_summary.json"
+    try:
+        if summary.exists():
+            obj = json.loads(summary.read_text(encoding="utf-8"))
+            if isinstance(obj, dict):
+                rec = obj.get("recommended")
+                if isinstance(rec, dict):
+                    adapter = str(rec.get("adapter_dir", "")).strip()
+                    if adapter:
+                        p = Path(adapter)
+                        if p.exists():
+                            return p
+                        alt = ROOT / "tiny-llm" / p
+                        if alt.exists():
+                            return alt
+    except Exception:
+        pass
+
+    # Fallback discovery order when summary is missing.
+    for root in [
+        ROOT / "tiny-llm" / "models" / "lora3b_code_review_max_repair_v1",
+        ROOT / "tiny-llm" / "models" / "lora3b_code_review_max_seed_v1",
+    ]:
+        latest = _latest_checkpoint(root)
+        if latest is not None:
+            return latest
+    return None
+
+
 def default_registry() -> Dict[str, ModelSpec]:
     reg: Dict[str, ModelSpec] = {}
     release_7b_merged = ROOT / "tiny-llm" / "models" / "releases" / "tyny-lm-7b-release1" / "merged_model"
@@ -98,6 +128,40 @@ def default_registry() -> Dict[str, ModelSpec]:
             model_name_or_path=str(lora3_latest),
             description="tiny-llm LoRA 3B (latest checkpoint)",
         )
+
+    merged_3b_release = ROOT / "tiny-llm" / "models" / "releases" / "tiny-3b-coding-r1" / "merged_model"
+    if merged_3b_release.exists() and (merged_3b_release / "config.json").exists():
+        reg["tiny-3b-coding"] = ModelSpec(
+            model_id="tiny-3b-coding",
+            mode="base",
+            model_name_or_path=str(merged_3b_release),
+            description="tiny 3B coding assistant merged release r1",
+        )
+    else:
+        coding_adapter = _recommended_max_3b_adapter()
+        if coding_adapter is not None:
+            reg["tiny-3b-coding"] = ModelSpec(
+                model_id="tiny-3b-coding",
+                mode="lora",
+                model_name_or_path=str(coding_adapter),
+                description="tiny 3B coding assistant (recommended checkpoint)",
+            )
+        else:
+            cpt_base = ROOT / "tiny-llm" / "models" / "base_3b_code_max_16gb_v1"
+            if cpt_base.exists() and (cpt_base / "config.json").exists():
+                reg["tiny-3b-coding"] = ModelSpec(
+                    model_id="tiny-3b-coding",
+                    mode="base",
+                    model_name_or_path=str(cpt_base),
+                    description="tiny 3B coding assistant base (CPT)",
+                )
+            else:
+                reg["tiny-3b-coding"] = ModelSpec(
+                    model_id="tiny-3b-coding",
+                    mode="base",
+                    model_name_or_path="Qwen/Qwen2.5-3B-Instruct",
+                    description="tiny 3B coding assistant (fallback to Qwen 3B base)",
+                )
 
     lora05_latest = _latest_checkpoint(ROOT / "tiny-llm" / "models" / "lora_repair_v2")
     if lora05_latest is not None:

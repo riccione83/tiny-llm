@@ -134,6 +134,84 @@ python .\04_train_lora.py `
   --save_total_limit 6
 ```
 
+Ready-made seed dataset in this repo:
+- `tiny-llm/samples/sft/code_review_seed.jsonl`
+- `tiny-llm/samples/sft/code_assistant_booster.jsonl`
+- `tiny-llm/samples/sft/code_review_synthetic.jsonl` (generated/expanded set)
+
+One-command pipeline script:
+
+```powershell
+cd tiny-llm
+.\run_3b_programming_review.ps1
+```
+
+Useful variants:
+
+```powershell
+cd tiny-llm
+.\run_3b_programming_review.ps1 -SkipDownloadBase
+.\run_3b_programming_review.ps1 -SkipDownloadBase -SkipCpt
+```
+
+Generate/refresh synthetic review data:
+
+```powershell
+cd tiny-llm
+python .\tools\generate_code_review_dataset.py --out_jsonl samples/sft/code_review_synthetic.jsonl --count 480
+```
+
+## 5B) MAX Pipeline (recommended for strongest local result)
+
+This pipeline adds:
+- stronger CPT budget
+- larger SFT mix
+- automatic top-checkpoint selection
+- repair stage
+- baseline vs candidate comparison reports
+
+```powershell
+cd tiny-llm
+.\run_3b_code_assistant_max.ps1
+```
+
+Useful variants:
+
+```powershell
+cd tiny-llm
+.\run_3b_code_assistant_max.ps1 -SkipDownloadBase
+.\run_3b_code_assistant_max.ps1 -SkipDownloadBase -SkipCpt
+```
+
+Dedicated code-assistant benchmark prompts:
+- `tiny-llm/samples/eval/code_assistant_eval.jsonl`
+
+Run benchmark manually on a selected checkpoint:
+
+```powershell
+cd tiny-llm
+python .\08_eval_code_assistant.py `
+  --base_model_dir models/base_3b_code_fast_16gb_v1 `
+  --adapter_dir models/lora3b_code_review_seed_v1/checkpoint-400 `
+  --prompts_jsonl samples/eval/code_assistant_eval.jsonl `
+  --out_json models/lora3b_code_review_seed_v1/code_assistant_eval_report.json `
+  --temperature 0.0 `
+  --max_new_tokens 240
+```
+
+Compare baseline vs candidate report:
+
+```powershell
+cd tiny-llm
+python .\09_compare_code_assistant_reports.py `
+  --baseline_report models/base_3b_code_max_16gb_v1/base_code_assistant_eval_report.json `
+  --candidate_report models/lora3b_code_review_max_seed_v1/code_eval_checkpoint-XXX.json `
+  --out_json models/lora3b_code_review_max_seed_v1/compare_vs_baseline.json
+```
+
+The MAX pipeline writes a final promotion summary:
+- `models/base_3b_code_max_16gb_v1/code_assistant_max_summary.json`
+
 ## 6) 16GB troubleshooting
 
 OOM:
@@ -150,3 +228,14 @@ Dataset too slow:
 - After fast CPT: better coding vocabulary/patterns.
 - To get close to Qwen 3B on review chat: you need review-specific data + SFT + continuous evaluation.
 - On a narrow domain (your stack, your standards), you can beat a general-purpose Qwen 3B.
+
+## 8) Can this beat Qwen 3B?
+
+Honest answer:
+- On broad, open-domain coding benchmarks: unlikely with a short local run.
+- On your narrow domain (your code style, stack, review rubric): yes, this is achievable.
+
+What makes the difference:
+1. High-quality review data (diff/snippet -> severity-ranked findings -> concrete fixes -> tests).
+2. Strict checkpoint selection (promote only measurable winners).
+3. 2-4 iteration cycles (data cleanup, retrain, compare).
