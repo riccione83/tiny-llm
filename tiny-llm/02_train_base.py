@@ -19,7 +19,7 @@ import re
 import signal
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Dict, Iterator, List, Optional, Tuple
+from typing import Callable, Dict, Iterator, List, Optional, Set, Tuple
 
 import torch
 from datasets import load_dataset
@@ -197,6 +197,15 @@ def parse_int_csv(spec: str, fallback: List[int]) -> List[int]:
     return sorted(set(vals))
 
 
+def parse_str_csv(spec: str) -> List[str]:
+    vals: List[str] = []
+    for part in (spec or "").split(","):
+        p = normalize_text(part).strip().lower()
+        if p:
+            vals.append(p)
+    return sorted(set(vals))
+
+
 def probe_shape_fits(model, vocab_size: int, batch_size: int, seq_len: int) -> Tuple[bool, int]:
     if not torch.cuda.is_available():
         return True, 0
@@ -359,20 +368,74 @@ def row_to_text(row: Dict[str, object], text_field: Optional[str]) -> Optional[s
     return None
 
 
+def infer_language_tag(row: Dict[str, object]) -> str:
+    direct_keys = ["language", "lang", "programming_language"]
+    for k in direct_keys:
+        v = row.get(k)
+        if isinstance(v, str):
+            lang = v.strip().lower()
+            if lang:
+                return lang
+
+    path_keys = ["path", "file_path", "filename", "repo_path"]
+    for k in path_keys:
+        v = row.get(k)
+        if not isinstance(v, str):
+            continue
+        p = v.strip().lower()
+        if p.endswith(".py"):
+            return "python"
+        if p.endswith(".ts"):
+            return "typescript"
+        if p.endswith(".tsx"):
+            return "tsx"
+        if p.endswith(".js"):
+            return "javascript"
+        if p.endswith(".jsx"):
+            return "jsx"
+    return ""
+
+
 def make_hf_text_iter(
     source: HFSource,
     allow_remote_dataset_code: bool,
     min_chars: int,
+    code_languages: Set[str],
+    require_language_tag: bool,
+    try_dataset_languages_param: bool,
 ) -> Callable[[], Iterator[str]]:
     def _iter() -> Iterator[str]:
         kwargs = {"split": source.split, "streaming": True, "trust_remote_code": allow_remote_dataset_code}
-        if source.config:
-            ds = load_dataset(source.name, source.config, **kwargs)
-        else:
-            ds = load_dataset(source.name, **kwargs)
+        lang_filter_list = sorted(code_languages) if code_languages else []
+        ds = None
+        if try_dataset_languages_param and lang_filter_list:
+            lang_kwargs = dict(kwargs)
+            lang_kwargs["languages"] = lang_filter_list
+            try:
+                if source.config:
+                    ds = load_dataset(source.name, source.config, **lang_kwargs)
+                else:
+                    ds = load_dataset(source.name, **lang_kwargs)
+                print(f"HF source {source.name}: applied dataset-level language filter {lang_filter_list}")
+            except Exception:
+                ds = None
+        if ds is None:
+            if source.config:
+                ds = load_dataset(source.name, source.config, **kwargs)
+            else:
+                ds = load_dataset(source.name, **kwargs)
 
         count = 0
+        skipped_lang = 0
         for row in ds:
+            if code_languages:
+                lang = infer_language_tag(row if isinstance(row, dict) else {})
+                if require_language_tag and not lang:
+                    skipped_lang += 1
+                    continue
+                if lang and lang not in code_languages:
+                    skipped_lang += 1
+                    continue
             txt = row_to_text(row, source.text_field)
             if not txt or len(txt) < min_chars:
                 continue
@@ -380,6 +443,8 @@ def make_hf_text_iter(
             count += 1
             if source.max_texts > 0 and count >= source.max_texts:
                 break
+        if skipped_lang > 0:
+            print(f"HF source {source.name}: skipped {skipped_lang} row(s) by language filter")
 
     return _iter
 
@@ -694,6 +759,23 @@ def main() -> None:
     ap.add_argument("--output_dir", default="models/base_trained")
     ap.add_argument("--recipe", default="standard", choices=["tiny", "standard", "knowledge-heavy"])
     ap.add_argument("--hf_source", action="append", default=[], help="Extra source: name|config|split|text_field|max_texts")
+    ap.add_argument(
+        "--hf_code_languages",
+        default="",
+        help="Optional CSV language filter for HF rows (e.g. python,typescript). Empty disables row-level filtering.",
+    )
+    ap.add_argument(
+        "--hf_require_language_tag",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="If true with --hf_code_languages, drop rows with missing language metadata.",
+    )
+    ap.add_argument(
+        "--hf_try_dataset_languages_param",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Try passing languages=[...] to load_dataset when --hf_code_languages is set; fallback automatically if unsupported.",
+    )
     ap.add_argument("--disable_hf_data", action="store_true", help="Use only local data globs")
     ap.add_argument("--allow_remote_dataset_code", action="store_true")
     ap.add_argument(
@@ -852,6 +934,13 @@ def main() -> None:
         )
 
     sources: List[Tuple[str, Callable[[], Iterator[str]]]] = []
+    hf_code_languages = set(parse_str_csv(str(args.hf_code_languages)))
+    if hf_code_languages:
+        print(
+            "HF code language filter enabled: "
+            f"{sorted(hf_code_languages)} "
+            f"(require_tag={'on' if bool(args.hf_require_language_tag) else 'off'})"
+        )
     if not args.disable_hf_data:
         for src in RECIPE_SOURCES[args.recipe]:
             max_texts = int(args.max_texts_per_source) if int(args.max_texts_per_source) > 0 else int(src.max_texts)
@@ -866,6 +955,9 @@ def main() -> None:
                 source=resolved,
                 allow_remote_dataset_code=bool(args.allow_remote_dataset_code),
                 min_chars=int(args.min_chars),
+                code_languages=hf_code_languages,
+                require_language_tag=bool(args.hf_require_language_tag),
+                try_dataset_languages_param=bool(args.hf_try_dataset_languages_param),
             )
             sources.append((f"hf:{resolved.name}", fn))
 
@@ -875,6 +967,9 @@ def main() -> None:
                 source=resolved,
                 allow_remote_dataset_code=bool(args.allow_remote_dataset_code),
                 min_chars=int(args.min_chars),
+                code_languages=hf_code_languages,
+                require_language_tag=bool(args.hf_require_language_tag),
+                try_dataset_languages_param=bool(args.hf_try_dataset_languages_param),
             )
             sources.append((f"hf:{resolved.name}", fn))
 

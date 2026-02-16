@@ -27,6 +27,40 @@ python -m pip install -U pip
 python -m pip install -r requirements.txt
 ```
 
+## Local OpenAI-Compatible API (Model Switch: base/lora)
+
+Run a local API server:
+
+```powershell
+python .\model_api_server.py --host 127.0.0.1 --port 8001 --default_model tiny-llm-7b
+```
+
+List available models:
+
+```powershell
+Invoke-RestMethod http://127.0.0.1:8001/v1/models | ConvertTo-Json -Depth 5
+```
+
+Chat completion request:
+
+```powershell
+$body = @{
+  model = "tiny-llm-7b"
+  messages = @(
+    @{ role = "user"; content = "Fix this code: def add(a,b): return a-b" }
+  )
+  temperature = 0.2
+  max_tokens = 300
+} | ConvertTo-Json -Depth 6
+
+Invoke-RestMethod -Uri "http://127.0.0.1:8001/v1/chat/completions" -Method Post -ContentType "application/json" -Body $body | ConvertTo-Json -Depth 8
+```
+
+The response includes OpenAI-style `choices` plus:
+- `model_used` (selected model id + source path)
+- `latency_ms`
+- `tokens`
+
 Run chat (search web automatically):
 
 ```powershell

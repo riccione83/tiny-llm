@@ -3,6 +3,8 @@ from typing import Dict, List
 import os
 from pathlib import Path
 import json
+import time
+import threading
 import torch
 
 from .tiny_backend import TinyLocalLLM
@@ -23,12 +25,26 @@ class HFLocalLLM:
         self._tok = None
         self._model = None
         self._device = "cuda" if torch.cuda.is_available() else "cpu"
+        self._last_profile: Dict[str, float | int | str] = {}
+        self._last_stream_pieces: List[str] = []
+        self._gen_lock = threading.Lock()
 
     @staticmethod
     def _from_pretrained_with_dtype(model_name: str, dtype: torch.dtype, device_map):
         from transformers import AutoModelForCausalLM  # type: ignore
 
-        kwargs = {"device_map": device_map}
+        attn_impl = os.environ.get("TINYLLM_ATTN_IMPL", "").strip().lower()
+        if not attn_impl:
+            if hasattr(torch.backends, "cuda") and hasattr(torch.backends.cuda, "flash_sdp_enabled"):
+                # Prefer fast SDPA kernels on recent CUDA stacks.
+                attn_impl = "sdpa"
+            else:
+                attn_impl = "eager"
+        kwargs = {
+            "device_map": device_map,
+            "attn_implementation": attn_impl,
+            "low_cpu_mem_usage": True,
+        }
         try:
             return AutoModelForCausalLM.from_pretrained(model_name, dtype=dtype, **kwargs)
         except TypeError:
@@ -70,29 +86,85 @@ class HFLocalLLM:
             if not base_model:
                 raise RuntimeError(f"LoRA adapter at {model_path} is missing base_model_name_or_path in adapter_config.json")
             model_source = base_model
+            base_model_path = Path(base_model)
+            if not base_model_path.is_absolute() and not base_model_path.exists():
+                alt_base = Path("tiny-llm") / base_model_path
+                if alt_base.exists():
+                    model_source = str(alt_base)
             if not ((model_path / "tokenizer.json").exists() or (model_path / "tokenizer.model").exists()):
-                tokenizer_source = base_model
+                tokenizer_source = model_source
 
         try:
             self._tok = AutoTokenizer.from_pretrained(tokenizer_source, use_fast=True)
         except Exception:
             self._tok = AutoTokenizer.from_pretrained(tokenizer_source, use_fast=False)
 
-        dtype = torch.float16 if self._device == "cuda" else torch.float32
         if self._device == "cuda":
+            bf16_ok = False
             try:
-                self._model = self._from_pretrained_with_dtype(model_source, dtype=dtype, device_map="auto")
-            except ValueError as e:
-                if "requires `accelerate`" not in str(e):
-                    raise
+                bf16_ok = bool(torch.cuda.is_bf16_supported())
+            except Exception:
+                bf16_ok = False
+            dtype = torch.bfloat16 if bf16_ok else torch.float16
+        else:
+            dtype = torch.float32
+        if self._device == "cuda":
+            # Prefer a full-GPU load for stability.
+            # Auto device_map can leave mixed meta/cpu states that are brittle
+            # for long-running API usage on Windows.
+            try:
                 self._model = self._from_pretrained_with_dtype(model_source, dtype=dtype, device_map=None)
                 self._model.to("cuda")
+            except RuntimeError as e:
+                msg = str(e).lower()
+                is_oom = ("out of memory" in msg) or ("cuda out of memory" in msg)
+                allow_auto_fallback = os.environ.get("TINYLLM_ALLOW_AUTO_DEVICE_MAP_FALLBACK", "0").strip() in {"1", "true", "yes"}
+                if is_oom and allow_auto_fallback:
+                    self._model = self._from_pretrained_with_dtype(model_source, dtype=dtype, device_map="auto")
+                else:
+                    raise RuntimeError(
+                        "Failed to load model fully on CUDA. "
+                        "Set TINYLLM_ALLOW_AUTO_DEVICE_MAP_FALLBACK=1 to allow auto offload fallback "
+                        "(may be unstable on some Windows setups). "
+                        f"Original error: {e}"
+                    ) from e
         else:
             self._model = self._from_pretrained_with_dtype(model_source, dtype=dtype, device_map=None)
             self._model.to("cpu")
         if adapter_source:
-            self._model = PeftModel.from_pretrained(self._model, adapter_source)
+            peft_kwargs = {}
+            try:
+                device_map = getattr(self._model, "hf_device_map", None)
+                needs_offload = bool(device_map) and len(set(device_map.values()).intersection({"cpu", "disk"})) > 0
+            except Exception:
+                needs_offload = False
+            if needs_offload:
+                offload_dir = str(Path(adapter_source) / "_offload")
+                Path(offload_dir).mkdir(parents=True, exist_ok=True)
+                peft_kwargs["offload_dir"] = offload_dir
+            self._model = PeftModel.from_pretrained(self._model, adapter_source, **peft_kwargs)
+        # Guarantee generation cache is enabled for decode speed.
+        try:
+            self._model.config.use_cache = True
+        except Exception:
+            pass
         self._model.eval()
+        if self._device == "cuda" and os.environ.get("TINYLLM_TORCH_COMPILE", "0").strip() in {"1", "true", "yes"}:
+            try:
+                self._model = torch.compile(self._model, mode="reduce-overhead", fullgraph=False)
+            except Exception as e:
+                print(f"[HFLocalLLM] torch.compile skipped: {e}")
+
+        # Detect accidental offload and keep a stable runtime profile.
+        offload_targets = set()
+        try:
+            device_map = getattr(self._model, "hf_device_map", None)
+            if isinstance(device_map, dict):
+                offload_targets = {str(v) for v in device_map.values()}
+        except Exception:
+            offload_targets = set()
+        if {"cpu", "disk"}.intersection(offload_targets):
+            print(f"[HFLocalLLM] Warning: model is partially offloaded: {sorted(offload_targets)}")
 
     def _build_prompt(self, messages: List[Dict[str, str]]) -> str:
         if self.use_chat_template and hasattr(self._tok, "apply_chat_template"):
@@ -112,32 +184,82 @@ class HFLocalLLM:
         return "\n\n".join(out)
 
     def generate(self, messages: List[Dict[str, str]]) -> str:
-        self._lazy_load()
-        prompt = self._build_prompt(messages)
-        inputs = self._tok(prompt, return_tensors="pt")
-        if self._device == "cuda":
-            inputs = {k: v.to(self._model.device) for k, v in inputs.items()}
-        do_sample = self.temperature > 1e-6
-        if not do_sample:
+        with self._gen_lock:
+            self._lazy_load()
+            prompt = self._build_prompt(messages)
+            t_tok0 = time.perf_counter()
+            inputs = self._tok(prompt, return_tensors="pt")
+            t_tok1 = time.perf_counter()
+            prompt_tokens = int(inputs["input_ids"].shape[1]) if "input_ids" in inputs else 0
+            if self._device == "cuda":
+                target_device = next(self._model.parameters()).device
+                inputs = {k: v.to(target_device, non_blocking=True) for k, v in inputs.items()}
+            do_sample = self.temperature > 1e-6
+            if not do_sample:
+                try:
+                    self._model.generation_config.top_k = None
+                    self._model.generation_config.top_p = None
+                    self._model.generation_config.temperature = None
+                except Exception:
+                    pass
+            t_gen0 = time.perf_counter()
+            with torch.inference_mode():
+                out_ids = self._model.generate(
+                    **inputs,
+                    max_new_tokens=max(16, self.max_new_tokens),
+                    do_sample=do_sample,
+                    temperature=max(0.01, self.temperature) if do_sample else None,
+                    top_p=0.95 if do_sample else None,
+                    use_cache=True,
+                    eos_token_id=self._tok.eos_token_id,
+                    pad_token_id=self._tok.eos_token_id,
+                )
+            if self._device == "cuda":
+                torch.cuda.synchronize()
+            t_gen1 = time.perf_counter()
+            gen = out_ids[0][inputs["input_ids"].shape[1] :]
+            text = self._tok.decode(gen, skip_special_tokens=True)
+            # Token-like chunks for SSE clients.
+            pieces: List[str] = []
             try:
-                self._model.generation_config.top_k = None
-                self._model.generation_config.top_p = None
-                self._model.generation_config.temperature = None
+                special_ids = set(getattr(self._tok, "all_special_ids", []) or [])
+                for tid in gen.tolist():
+                    if int(tid) in special_ids:
+                        continue
+                    frag = self._tok.decode([int(tid)], skip_special_tokens=False)
+                    if frag:
+                        pieces.append(frag)
+            except Exception:
+                pieces = []
+            self._last_stream_pieces = pieces
+            gen_tokens = int(gen.shape[0])
+            gen_s = max(1e-9, (t_gen1 - t_gen0))
+            tok_s = max(0.0, (t_tok1 - t_tok0))
+            device = "cpu"
+            dtype = "unknown"
+            gpu_mem_mb = 0.0
+            try:
+                p0 = next(self._model.parameters())
+                device = str(p0.device)
+                dtype = str(p0.dtype).replace("torch.", "")
             except Exception:
                 pass
-        with torch.no_grad():
-            out_ids = self._model.generate(
-                **inputs,
-                max_new_tokens=max(16, self.max_new_tokens),
-                do_sample=do_sample,
-                temperature=max(0.01, self.temperature) if do_sample else None,
-                top_p=0.95 if do_sample else None,
-                eos_token_id=self._tok.eos_token_id,
-                pad_token_id=self._tok.eos_token_id,
-            )
-        gen = out_ids[0][inputs["input_ids"].shape[1] :]
-        text = self._tok.decode(gen, skip_special_tokens=True)
-        return text.strip()
+            if self._device == "cuda":
+                try:
+                    gpu_mem_mb = float(torch.cuda.memory_allocated() / (1024.0 * 1024.0))
+                except Exception:
+                    gpu_mem_mb = 0.0
+            self._last_profile = {
+                "tokenize_ms": round(tok_s * 1000.0, 2),
+                "generate_ms": round(gen_s * 1000.0, 2),
+                "prompt_tokens": prompt_tokens,
+                "tokens_generated": gen_tokens,
+                "tokens_per_sec": round(gen_tokens / gen_s, 2),
+                "device": device,
+                "dtype": dtype,
+                "gpu_mem_allocated_mb": round(gpu_mem_mb, 2),
+            }
+            return text.strip()
 
 
 class LocalLLM:
