@@ -17,20 +17,24 @@ class HFLocalLLM:
         max_new_tokens: int = 160,
         temperature: float = 0.0,
         use_chat_template: bool = True,
+        quantization: str = "auto",
     ) -> None:
         self.model_name = model_name
         self.max_new_tokens = int(max_new_tokens)
         self.temperature = float(temperature)
         self.use_chat_template = bool(use_chat_template)
+        self.quantization = str(quantization or "auto").strip().lower()
         self._tok = None
         self._model = None
         self._device = "cuda" if torch.cuda.is_available() else "cpu"
         self._last_profile: Dict[str, float | int | str] = {}
         self._last_stream_pieces: List[str] = []
         self._gen_lock = threading.Lock()
+        self._context_window_tokens = 0
+        self._quant_mode_effective = "none"
 
     @staticmethod
-    def _from_pretrained_with_dtype(model_name: str, dtype: torch.dtype, device_map):
+    def _from_pretrained(model_name: str, dtype: torch.dtype, device_map, quantization_config=None):
         from transformers import AutoModelForCausalLM  # type: ignore
 
         attn_impl = os.environ.get("TINYLLM_ATTN_IMPL", "").strip().lower()
@@ -45,10 +49,89 @@ class HFLocalLLM:
             "attn_implementation": attn_impl,
             "low_cpu_mem_usage": True,
         }
+        if quantization_config is not None:
+            kwargs["quantization_config"] = quantization_config
         try:
-            return AutoModelForCausalLM.from_pretrained(model_name, dtype=dtype, **kwargs)
+            if quantization_config is None:
+                return AutoModelForCausalLM.from_pretrained(model_name, dtype=dtype, **kwargs)
+            return AutoModelForCausalLM.from_pretrained(model_name, **kwargs)
         except TypeError:
-            return AutoModelForCausalLM.from_pretrained(model_name, torch_dtype=dtype, **kwargs)
+            if quantization_config is None:
+                return AutoModelForCausalLM.from_pretrained(model_name, torch_dtype=dtype, **kwargs)
+            return AutoModelForCausalLM.from_pretrained(model_name, **kwargs)
+
+    def _resolve_quantization(self):
+        mode = self.quantization
+        if mode not in {"auto", "none", "4bit", "8bit"}:
+            mode = "auto"
+        if self._device != "cuda":
+            return None, "none"
+        if mode == "auto":
+            # Keep smaller models unquantized by default and prefer 4-bit for larger models.
+            needle = self.model_name.lower()
+            large_markers = ("7b", "8b", "13b", "14b", "32b", "34b", "70b")
+            mode = "4bit" if any(m in needle for m in large_markers) else "none"
+        if mode == "none":
+            return None, "none"
+        try:
+            from transformers import BitsAndBytesConfig  # type: ignore
+            import importlib.util
+
+            if importlib.util.find_spec("bitsandbytes") is None:
+                raise RuntimeError("bitsandbytes package is not installed")
+            bf16_ok = False
+            try:
+                bf16_ok = bool(torch.cuda.is_bf16_supported())
+            except Exception:
+                bf16_ok = False
+            compute_dtype = torch.bfloat16 if bf16_ok else torch.float16
+            if mode == "8bit":
+                qcfg = BitsAndBytesConfig(load_in_8bit=True)
+                return qcfg, "8bit"
+            qcfg = BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_quant_type="nf4",
+                bnb_4bit_use_double_quant=True,
+                bnb_4bit_compute_dtype=compute_dtype,
+            )
+            return qcfg, "4bit"
+        except Exception as e:
+            print(f"[HFLocalLLM] Quantization '{mode}' unavailable, using full precision: {e}")
+            return None, "none"
+
+    def _infer_context_window_tokens(self) -> int:
+        values: List[int] = []
+        cfg = getattr(self._model, "config", None)
+        for key in ("max_position_embeddings", "n_positions", "seq_length", "max_seq_len", "model_max_length"):
+            try:
+                v = int(getattr(cfg, key))
+                if v > 0:
+                    values.append(v)
+            except Exception:
+                pass
+        try:
+            rope = getattr(cfg, "rope_scaling", None)
+            if isinstance(rope, dict):
+                factor = float(rope.get("factor", 1.0))
+                orig = int(
+                    rope.get("original_max_position_embeddings", 0)
+                    or getattr(cfg, "max_position_embeddings", 0)
+                    or 0
+                )
+                if factor > 1.0 and orig > 0:
+                    values.append(int(orig * factor))
+        except Exception:
+            pass
+        try:
+            tok_max = int(getattr(self._tok, "model_max_length", 0))
+            # Ignore "very large sentinel" values often used by tokenizers.
+            if 0 < tok_max < 1_000_000:
+                values.append(tok_max)
+        except Exception:
+            pass
+        if not values:
+            return 0
+        return min(values)
 
     def _lazy_load(self) -> None:
         if self._tok is not None and self._model is not None:
@@ -106,30 +189,66 @@ class HFLocalLLM:
             except Exception:
                 bf16_ok = False
             dtype = torch.bfloat16 if bf16_ok else torch.float16
+            tf32_on = os.environ.get("TINYLLM_TF32", "1").strip().lower() in {"1", "true", "yes"}
+            try:
+                if hasattr(torch.backends, "cuda") and hasattr(torch.backends.cuda, "matmul"):
+                    torch.backends.cuda.matmul.allow_tf32 = bool(tf32_on)
+                if hasattr(torch.backends, "cudnn"):
+                    torch.backends.cudnn.allow_tf32 = bool(tf32_on)
+                if hasattr(torch, "set_float32_matmul_precision"):
+                    torch.set_float32_matmul_precision("high" if tf32_on else "highest")
+            except Exception:
+                pass
+            flash_only = os.environ.get("TINYLLM_SDPA_FLASH_ONLY", "0").strip().lower() in {"1", "true", "yes"}
+            if flash_only:
+                try:
+                    if hasattr(torch.backends.cuda, "enable_flash_sdp"):
+                        torch.backends.cuda.enable_flash_sdp(True)
+                    if hasattr(torch.backends.cuda, "enable_mem_efficient_sdp"):
+                        torch.backends.cuda.enable_mem_efficient_sdp(False)
+                    if hasattr(torch.backends.cuda, "enable_math_sdp"):
+                        torch.backends.cuda.enable_math_sdp(False)
+                except Exception as e:
+                    print(f"[HFLocalLLM] flash-only SDPA setup skipped: {e}")
         else:
             dtype = torch.float32
+        quantization_config, quant_mode_effective = self._resolve_quantization()
+        self._quant_mode_effective = str(quant_mode_effective)
         if self._device == "cuda":
-            # Prefer a full-GPU load for stability.
-            # Auto device_map can leave mixed meta/cpu states that are brittle
-            # for long-running API usage on Windows.
-            try:
-                self._model = self._from_pretrained_with_dtype(model_source, dtype=dtype, device_map=None)
-                self._model.to("cuda")
-            except RuntimeError as e:
-                msg = str(e).lower()
-                is_oom = ("out of memory" in msg) or ("cuda out of memory" in msg)
-                allow_auto_fallback = os.environ.get("TINYLLM_ALLOW_AUTO_DEVICE_MAP_FALLBACK", "0").strip() in {"1", "true", "yes"}
-                if is_oom and allow_auto_fallback:
-                    self._model = self._from_pretrained_with_dtype(model_source, dtype=dtype, device_map="auto")
-                else:
+            if quantization_config is not None:
+                try:
+                    self._model = self._from_pretrained(
+                        model_source,
+                        dtype=dtype,
+                        device_map="auto",
+                        quantization_config=quantization_config,
+                    )
+                except RuntimeError as e:
                     raise RuntimeError(
-                        "Failed to load model fully on CUDA. "
-                        "Set TINYLLM_ALLOW_AUTO_DEVICE_MAP_FALLBACK=1 to allow auto offload fallback "
-                        "(may be unstable on some Windows setups). "
-                        f"Original error: {e}"
+                        f"Failed to load quantized model ({self._quant_mode_effective}) on CUDA: {e}"
                     ) from e
+            else:
+                # Prefer a full-GPU load for stability.
+                # Auto device_map can leave mixed meta/cpu states that are brittle
+                # for long-running API usage on Windows.
+                try:
+                    self._model = self._from_pretrained(model_source, dtype=dtype, device_map=None)
+                    self._model.to("cuda")
+                except RuntimeError as e:
+                    msg = str(e).lower()
+                    is_oom = ("out of memory" in msg) or ("cuda out of memory" in msg)
+                    allow_auto_fallback = os.environ.get("TINYLLM_ALLOW_AUTO_DEVICE_MAP_FALLBACK", "0").strip() in {"1", "true", "yes"}
+                    if is_oom and allow_auto_fallback:
+                        self._model = self._from_pretrained(model_source, dtype=dtype, device_map="auto")
+                    else:
+                        raise RuntimeError(
+                            "Failed to load model fully on CUDA. "
+                            "Set TINYLLM_ALLOW_AUTO_DEVICE_MAP_FALLBACK=1 to allow auto offload fallback "
+                            "(may be unstable on some Windows setups). "
+                            f"Original error: {e}"
+                        ) from e
         else:
-            self._model = self._from_pretrained_with_dtype(model_source, dtype=dtype, device_map=None)
+            self._model = self._from_pretrained(model_source, dtype=dtype, device_map=None)
             self._model.to("cpu")
         if adapter_source:
             peft_kwargs = {}
@@ -165,6 +284,14 @@ class HFLocalLLM:
             offload_targets = set()
         if {"cpu", "disk"}.intersection(offload_targets):
             print(f"[HFLocalLLM] Warning: model is partially offloaded: {sorted(offload_targets)}")
+        self._context_window_tokens = int(self._infer_context_window_tokens())
+        if self._context_window_tokens > 0:
+            print(
+                f"[HFLocalLLM] Loaded model={self.model_name} "
+                f"quant={self._quant_mode_effective} context={self._context_window_tokens}"
+            )
+        else:
+            print(f"[HFLocalLLM] Loaded model={self.model_name} quant={self._quant_mode_effective}")
 
     def _build_prompt(self, messages: List[Dict[str, str]]) -> str:
         if self.use_chat_template and hasattr(self._tok, "apply_chat_template"):
@@ -203,17 +330,52 @@ class HFLocalLLM:
                 except Exception:
                     pass
             t_gen0 = time.perf_counter()
-            with torch.inference_mode():
-                out_ids = self._model.generate(
-                    **inputs,
-                    max_new_tokens=max(16, self.max_new_tokens),
-                    do_sample=do_sample,
-                    temperature=max(0.01, self.temperature) if do_sample else None,
-                    top_p=0.95 if do_sample else None,
-                    use_cache=True,
-                    eos_token_id=self._tok.eos_token_id,
-                    pad_token_id=self._tok.eos_token_id,
+            try:
+                with torch.inference_mode():
+                    out_ids = self._model.generate(
+                        **inputs,
+                        max_new_tokens=max(16, self.max_new_tokens),
+                        do_sample=do_sample,
+                        temperature=max(0.01, self.temperature) if do_sample else None,
+                        top_p=0.95 if do_sample else None,
+                        use_cache=True,
+                        eos_token_id=self._tok.eos_token_id,
+                        pad_token_id=self._tok.eos_token_id,
+                    )
+            except Exception as e:
+                flash_only = os.environ.get("TINYLLM_SDPA_FLASH_ONLY", "0").strip().lower() in {"1", "true", "yes"}
+                if (not flash_only) or self._device != "cuda":
+                    raise
+                msg = str(e).lower()
+                flash_related = (
+                    "no available kernel" in msg
+                    or "flash attention" in msg
+                    or "sdp" in msg
                 )
+                if not flash_related:
+                    raise
+                # Fallback path for unsupported flash kernels on some CUDA/PyTorch stacks.
+                try:
+                    if hasattr(torch.backends.cuda, "enable_mem_efficient_sdp"):
+                        torch.backends.cuda.enable_mem_efficient_sdp(True)
+                    if hasattr(torch.backends.cuda, "enable_math_sdp"):
+                        torch.backends.cuda.enable_math_sdp(True)
+                    if hasattr(torch.backends.cuda, "enable_flash_sdp"):
+                        torch.backends.cuda.enable_flash_sdp(True)
+                    with torch.inference_mode():
+                        out_ids = self._model.generate(
+                            **inputs,
+                            max_new_tokens=max(16, self.max_new_tokens),
+                            do_sample=do_sample,
+                            temperature=max(0.01, self.temperature) if do_sample else None,
+                            top_p=0.95 if do_sample else None,
+                            use_cache=True,
+                            eos_token_id=self._tok.eos_token_id,
+                            pad_token_id=self._tok.eos_token_id,
+                        )
+                    print(f"[HFLocalLLM] Flash-only SDPA fallback engaged: {e}")
+                except Exception:
+                    raise
             if self._device == "cuda":
                 torch.cuda.synchronize()
             t_gen1 = time.perf_counter()
@@ -257,9 +419,19 @@ class HFLocalLLM:
                 "tokens_per_sec": round(gen_tokens / gen_s, 2),
                 "device": device,
                 "dtype": dtype,
+                "quantization": self._quant_mode_effective,
                 "gpu_mem_allocated_mb": round(gpu_mem_mb, 2),
             }
             return text.strip()
+
+    def ensure_loaded(self) -> None:
+        with self._gen_lock:
+            self._lazy_load()
+
+    def context_window_tokens(self) -> int:
+        with self._gen_lock:
+            self._lazy_load()
+            return int(self._context_window_tokens)
 
 
 class LocalLLM:
@@ -274,6 +446,7 @@ class LocalLLM:
         tiny_lora: str = "",
         tiny_top_p: float = 1.0,
         use_chat_template: bool = True,
+        quantization: str = "auto",
     ) -> None:
         b = (backend or "hf").strip().lower()
         if b == "tiny":
@@ -291,7 +464,22 @@ class LocalLLM:
                 max_new_tokens=max_new_tokens,
                 temperature=temperature,
                 use_chat_template=bool(use_chat_template),
+                quantization=str(quantization),
             )
 
     def generate(self, messages: List[Dict[str, str]]) -> str:
         return self._impl.generate(messages)
+
+    def ensure_loaded(self) -> None:
+        lazy = getattr(self._impl, "ensure_loaded", None)
+        if callable(lazy):
+            lazy()
+
+    def context_window_tokens(self) -> int:
+        fn = getattr(self._impl, "context_window_tokens", None)
+        if callable(fn):
+            try:
+                return int(fn())
+            except Exception:
+                return 0
+        return 0

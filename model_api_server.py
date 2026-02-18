@@ -15,6 +15,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import queue
+import threading
 import time
 import uuid
 from dataclasses import dataclass
@@ -34,6 +37,121 @@ class ModelSpec:
     mode: str  # base | lora
     model_name_or_path: str
     description: str
+
+
+@dataclass
+class GenerationResult:
+    text: str
+    latency_ms: int
+    queue_wait_ms: int
+    profile: Dict[str, Any]
+    stream_pieces: List[str]
+
+
+class OverloadedError(RuntimeError):
+    pass
+
+
+class _GenerationTask:
+    def __init__(self, messages: List[Dict[str, str]], temperature: float, max_new_tokens: int) -> None:
+        self.messages = messages
+        self.temperature = float(temperature)
+        self.max_new_tokens = int(max_new_tokens)
+        self.enqueued_at = time.perf_counter()
+        self.done = threading.Event()
+        self.result: Optional[GenerationResult] = None
+        self.error: Optional[Exception] = None
+
+
+class ModelRuntime:
+    def __init__(
+        self,
+        model_id: str,
+        llm: LocalLLM,
+        queue_size: int,
+    ) -> None:
+        self.model_id = str(model_id)
+        self.llm = llm
+        self._queue: "queue.Queue[Optional[_GenerationTask]]" = queue.Queue(maxsize=max(1, int(queue_size)))
+        self._active = 0
+        self._active_lock = threading.Lock()
+        self._worker = threading.Thread(target=self._worker_loop, name=f"model-worker-{self.model_id}", daemon=True)
+        self._worker.start()
+
+    def _worker_loop(self) -> None:
+        while True:
+            task = self._queue.get()
+            if task is None:
+                self._queue.task_done()
+                return
+            try:
+                with self._active_lock:
+                    self._active += 1
+                started_at = time.perf_counter()
+                queue_wait_ms = int((started_at - task.enqueued_at) * 1000)
+                impl = getattr(self.llm, "_impl", None)
+                if impl is not None:
+                    if hasattr(impl, "temperature"):
+                        try:
+                            impl.temperature = float(task.temperature)
+                        except Exception:
+                            pass
+                    if hasattr(impl, "max_new_tokens"):
+                        try:
+                            impl.max_new_tokens = int(task.max_new_tokens)
+                        except Exception:
+                            pass
+                t0 = time.perf_counter()
+                out = self.llm.generate(task.messages)
+                latency_ms = int((time.perf_counter() - t0) * 1000)
+                impl = getattr(self.llm, "_impl", None)
+                prof = getattr(impl, "_last_profile", {}) if impl is not None else {}
+                pieces_raw = getattr(impl, "_last_stream_pieces", None) if impl is not None else None
+                pieces = list(pieces_raw) if isinstance(pieces_raw, list) else []
+                task.result = GenerationResult(
+                    text=out,
+                    latency_ms=latency_ms,
+                    queue_wait_ms=queue_wait_ms,
+                    profile=dict(prof) if isinstance(prof, dict) else {},
+                    stream_pieces=pieces,
+                )
+            except Exception as exc:
+                task.error = exc
+            finally:
+                with self._active_lock:
+                    self._active = max(0, int(self._active) - 1)
+                task.done.set()
+                self._queue.task_done()
+
+    def submit(
+        self,
+        messages: List[Dict[str, str]],
+        temperature: float,
+        max_new_tokens: int,
+        timeout_s: float,
+    ) -> GenerationResult:
+        task = _GenerationTask(messages=messages, temperature=temperature, max_new_tokens=max_new_tokens)
+        try:
+            self._queue.put_nowait(task)
+        except queue.Full as exc:
+            raise OverloadedError(
+                f"Model '{self.model_id}' is overloaded (queue full: max={self._queue.maxsize})."
+            ) from exc
+        waited = task.done.wait(None if timeout_s <= 0 else float(timeout_s))
+        if not waited:
+            raise TimeoutError(
+                f"Timed out waiting for model '{self.model_id}' after {timeout_s:.1f}s."
+            )
+        if task.error is not None:
+            raise task.error
+        if task.result is None:
+            raise RuntimeError("Generation finished without result")
+        return task.result
+
+    def pending(self) -> int:
+        with self._active_lock:
+            active = int(self._active)
+        return int(self._queue.qsize()) + active
 
 
 def _latest_checkpoint(adapter_root: Path) -> Optional[Path]:
@@ -319,6 +437,25 @@ def _truncate_messages_to_token_budget(
     return kept, removed, cur
 
 
+def _is_cuda_oom(exc: Exception) -> bool:
+    s = str(exc).lower()
+    return (
+        "out of memory" in s
+        or "cuda out of memory" in s
+        or "cudaerrormemoryallocation" in s
+    )
+
+
+def _try_release_cuda_cache() -> None:
+    try:
+        import torch  # type: ignore
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:
+        pass
+
+
 class ServerState:
     def __init__(
         self,
@@ -327,10 +464,16 @@ class ServerState:
         use_chat_template: bool,
         http_debug: bool = False,
         http_debug_max_chars: int = 2000,
-        max_prompt_tokens: int = 1024,
+        max_prompt_tokens: int = 0,
+        prompt_token_reserve: int = 768,
         fixed_response_text: str = "",
-        max_completion_tokens_cap: int = 512,
-        max_request_bytes: int = 32768,
+        max_completion_tokens_cap: int = 160,
+        max_request_bytes: int = 16777216,
+        queue_size_per_model: int = 8,
+        request_timeout_s: float = 300.0,
+        quantization: str = "4bit",
+        model_replicas: int = 1,
+        max_prompt_tokens_auto_cap: int = 4096,
     ) -> None:
         self.registry = registry
         self.default_model = default_model
@@ -338,10 +481,22 @@ class ServerState:
         self.http_debug = bool(http_debug)
         self.http_debug_max_chars = max(200, int(http_debug_max_chars))
         self.max_prompt_tokens = max(0, int(max_prompt_tokens))
+        self.prompt_token_reserve = max(64, int(prompt_token_reserve))
         self.fixed_response_text = str(fixed_response_text or "").strip()
         self.max_completion_tokens_cap = max(1, int(max_completion_tokens_cap))
         self.max_request_bytes = max(1024, int(max_request_bytes))
+        self.queue_size_per_model = max(1, int(queue_size_per_model))
+        self.request_timeout_s = max(0.0, float(request_timeout_s))
+        self.quantization = str(quantization or "auto").strip().lower()
+        self.model_replicas = max(1, int(model_replicas))
+        self.max_prompt_tokens_auto_cap = max(0, int(max_prompt_tokens_auto_cap))
         self.cache: Dict[str, LocalLLM] = {}
+        self.runtimes: Dict[str, ModelRuntime] = {}
+        self.runtime_pools: Dict[str, List[ModelRuntime]] = {}
+        self.context_tokens_cache: Dict[str, int] = {}
+        self._cache_lock = threading.Lock()
+        self._runtime_lock = threading.Lock()
+        self._context_lock = threading.Lock()
 
     def resolve_model(self, model_id: str) -> Tuple[str, ModelSpec]:
         mid = (model_id or "").strip() or self.default_model
@@ -349,42 +504,106 @@ class ServerState:
             raise KeyError(f"Unknown model '{mid}'. Use GET /v1/models.")
         return mid, self.registry[mid]
 
-    def get_llm(self, model_id: str, spec: ModelSpec, temperature: float, max_new_tokens: int) -> LocalLLM:
-        # Keep one loaded instance per model id to avoid repeated large-model
-        # dispatch/offload churn across requests.
-        key = f"{model_id}|{int(self.use_chat_template)}"
-        if key in self.cache:
-            llm = self.cache[key]
-            self._apply_runtime_generation_settings(llm, temperature=temperature, max_new_tokens=max_new_tokens)
-            return llm
-        llm = LocalLLM(
-            backend="hf",
-            model_name=spec.model_name_or_path,
-            temperature=float(temperature),
-            max_new_tokens=int(max_new_tokens),
-            use_chat_template=self.use_chat_template,
-        )
-        self._apply_runtime_generation_settings(llm, temperature=temperature, max_new_tokens=max_new_tokens)
-        self.cache[key] = llm
-        return llm
+    def _runtime_key(self, model_id: str) -> str:
+        return f"{model_id}|{int(self.use_chat_template)}|{self.quantization}"
 
     @staticmethod
-    def _apply_runtime_generation_settings(llm: LocalLLM, temperature: float, max_new_tokens: int) -> None:
-        # LocalLLM wraps either HFLocalLLM or TinyLocalLLM. For this API server
-        # we only use HF backend, but keep this defensive.
-        impl = getattr(llm, "_impl", None)
-        if impl is None:
-            return
-        if hasattr(impl, "temperature"):
-            try:
-                impl.temperature = float(temperature)
-            except Exception:
-                pass
-        if hasattr(impl, "max_new_tokens"):
-            try:
-                impl.max_new_tokens = int(max_new_tokens)
-            except Exception:
-                pass
+    def _replica_key(base_key: str, replica_idx: int) -> str:
+        return f"{base_key}|r{int(replica_idx)}"
+
+    def get_llm(self, model_id: str, spec: ModelSpec, replica_idx: int = 0) -> LocalLLM:
+        # Keep one loaded instance per model id to avoid repeated large-model
+        # dispatch/offload churn across requests.
+        key = self._replica_key(self._runtime_key(model_id), replica_idx=replica_idx)
+        with self._cache_lock:
+            if key in self.cache:
+                return self.cache[key]
+            llm = LocalLLM(
+                backend="hf",
+                model_name=spec.model_name_or_path,
+                temperature=0.0,
+                max_new_tokens=max(16, int(self.max_completion_tokens_cap)),
+                use_chat_template=self.use_chat_template,
+                quantization=self.quantization,
+            )
+            self.cache[key] = llm
+            return llm
+
+    def get_runtime_pool(self, model_id: str, spec: ModelSpec) -> List[ModelRuntime]:
+        base_key = self._runtime_key(model_id)
+        with self._runtime_lock:
+            pool = self.runtime_pools.get(base_key, [])
+            if len(pool) < int(self.model_replicas):
+                for idx in range(len(pool), int(self.model_replicas)):
+                    rkey = self._replica_key(base_key, replica_idx=idx)
+                    if rkey in self.runtimes:
+                        pool.append(self.runtimes[rkey])
+                        continue
+                    llm = self.get_llm(model_id=model_id, spec=spec, replica_idx=idx)
+                    runtime = ModelRuntime(
+                        model_id=f"{model_id}:r{idx}",
+                        llm=llm,
+                        queue_size=int(self.queue_size_per_model),
+                    )
+                    self.runtimes[rkey] = runtime
+                    pool.append(runtime)
+                self.runtime_pools[base_key] = list(pool)
+            return list(pool)
+
+    def get_runtime(self, model_id: str, spec: ModelSpec) -> ModelRuntime:
+        pool = self.get_runtime_pool(model_id=model_id, spec=spec)
+        if not pool:
+            raise RuntimeError(f"No runtime available for model '{model_id}'.")
+        return min(pool, key=lambda rt: rt.pending())
+
+    def generate(
+        self,
+        model_id: str,
+        spec: ModelSpec,
+        messages: List[Dict[str, str]],
+        temperature: float,
+        max_new_tokens: int,
+    ) -> Tuple[GenerationResult, LocalLLM]:
+        runtime = self.get_runtime(model_id=model_id, spec=spec)
+        result = runtime.submit(
+            messages=messages,
+            temperature=float(temperature),
+            max_new_tokens=int(max_new_tokens),
+            timeout_s=float(self.request_timeout_s),
+        )
+        return result, runtime.llm
+
+    def get_context_tokens(self, model_id: str, spec: ModelSpec, llm: Optional[LocalLLM] = None) -> int:
+        key = self._runtime_key(model_id)
+        with self._context_lock:
+            cached = self.context_tokens_cache.get(key)
+        if isinstance(cached, int) and cached > 0:
+            return cached
+        target_llm = llm or self.get_llm(model_id=model_id, spec=spec, replica_idx=0)
+        target_llm.ensure_loaded()
+        ctx = 0
+        try:
+            ctx = int(target_llm.context_window_tokens())
+        except Exception:
+            ctx = 0
+        if ctx > 0:
+            with self._context_lock:
+                self.context_tokens_cache[key] = int(ctx)
+        return max(0, int(ctx))
+
+    def effective_max_prompt_tokens(self, model_ctx_tokens: int, max_completion_tokens: int) -> int:
+        configured = int(self.max_prompt_tokens)
+        if configured > 0:
+            return configured
+        model_ctx = max(0, int(model_ctx_tokens))
+        if model_ctx <= 0:
+            # Fallback when model context cannot be inferred yet.
+            return 4096
+        reserve = max(int(self.prompt_token_reserve), int(max_completion_tokens) + 64)
+        auto_budget = max(256, model_ctx - reserve)
+        if int(self.max_prompt_tokens_auto_cap) > 0:
+            auto_budget = min(int(self.max_prompt_tokens_auto_cap), auto_budget)
+        return auto_budget
 
 
 def make_handler(state: ServerState):
@@ -496,44 +715,81 @@ def make_handler(state: ServerState):
                 include_usage = bool(stream_options.get("include_usage", False))
                 model_id, spec = state.resolve_model(model)
                 llm = None
+                token_like_pieces: List[str] = []
                 if state.fixed_response_text:
                     # Debug mode: bypass model to validate client protocol handling.
                     out = state.fixed_response_text
                     latency_ms = 0
+                    queue_wait_ms = 0
                     prompt_text = "\n".join(f"{m['role']}: {m['content']}" for m in messages)
                     prompt_tokens = max(1, len(prompt_text.split()))
                     completion_tokens = max(1, len(out.split()))
                     print(f"[fixed] model={model_id} completion_tokens={completion_tokens}")
                 else:
-                    llm = state.get_llm(
-                        model_id=model_id,
-                        spec=spec,
-                        temperature=temperature,
-                        max_new_tokens=max_tokens,
+                    runtime = state.get_runtime(model_id=model_id, spec=spec)
+                    llm = runtime.llm
+                    model_ctx_tokens = state.get_context_tokens(model_id=model_id, spec=spec, llm=llm)
+                    max_prompt_budget = state.effective_max_prompt_tokens(
+                        model_ctx_tokens=model_ctx_tokens,
+                        max_completion_tokens=max_tokens,
                     )
-                    original_msg_count = len(messages)
+                    source_messages = list(messages)
+                    original_msg_count = len(source_messages)
                     messages, removed_count, prompt_tokens_after_trim = _truncate_messages_to_token_budget(
                         llm=llm,
-                        messages=messages,
-                        max_prompt_tokens=int(state.max_prompt_tokens),
+                        messages=source_messages,
+                        max_prompt_tokens=max_prompt_budget,
                         use_chat_template=bool(state.use_chat_template),
                     )
                     if removed_count > 0:
                         print(
                             f"[trim] model={model_id} removed_messages={removed_count} "
                             f"orig_messages={original_msg_count} prompt_tokens_after_trim={prompt_tokens_after_trim} "
-                            f"max_prompt_tokens={state.max_prompt_tokens}"
+                            f"max_prompt_tokens={max_prompt_budget}"
                         )
-                    prompt_text = "\n".join(f"{m['role']}: {m['content']}" for m in messages)
-                    t0 = time.perf_counter()
-                    out = llm.generate(messages)
-                    latency_ms = int((time.perf_counter() - t0) * 1000)
-                    impl = getattr(llm, "_impl", None)
-                    prof = getattr(impl, "_last_profile", {}) if impl is not None else {}
+                    try:
+                        generation, llm = state.generate(
+                            model_id=model_id,
+                            spec=spec,
+                            messages=messages,
+                            temperature=temperature,
+                            max_new_tokens=max_tokens,
+                        )
+                    except Exception as gen_exc:
+                        if _is_cuda_oom(gen_exc) and max_prompt_budget > 512:
+                            _try_release_cuda_cache()
+                            retry_budget = max(512, int(max_prompt_budget * 0.7))
+                            retry_messages, retry_removed, retry_tokens = _truncate_messages_to_token_budget(
+                                llm=llm,
+                                messages=source_messages,
+                                max_prompt_tokens=retry_budget,
+                                use_chat_template=bool(state.use_chat_template),
+                            )
+                            print(
+                                f"[oom-retry] model={model_id} "
+                                f"orig_budget={max_prompt_budget} retry_budget={retry_budget} "
+                                f"removed_messages={retry_removed} prompt_tokens_after_trim={retry_tokens}"
+                            )
+                            messages = retry_messages
+                            generation, llm = state.generate(
+                                model_id=model_id,
+                                spec=spec,
+                                messages=messages,
+                                temperature=temperature,
+                                max_new_tokens=max_tokens,
+                            )
+                        else:
+                            raise
+                    out = generation.text
+                    latency_ms = int(generation.latency_ms)
+                    queue_wait_ms = int(generation.queue_wait_ms)
+                    prof = generation.profile
+                    token_like_pieces = generation.stream_pieces
                     if isinstance(prof, dict) and prof:
                         print(
                             "[perf] "
                             f"model={model_id} "
+                            f"queue_wait_ms={queue_wait_ms} "
                             f"tokenize_ms={prof.get('tokenize_ms')} "
                             f"generate_ms={prof.get('generate_ms')} "
                             f"prompt_tokens={prof.get('prompt_tokens')} "
@@ -541,10 +797,21 @@ def make_handler(state: ServerState):
                             f"tok_s={prof.get('tokens_per_sec')} "
                             f"device={prof.get('device')} "
                             f"dtype={prof.get('dtype')} "
+                            f"quant={prof.get('quantization')} "
                             f"gpu_mem_mb={prof.get('gpu_mem_allocated_mb')}"
                         )
-                    prompt_tokens = _count_tokens(llm, prompt_text)
-                    completion_tokens = _count_tokens(llm, out)
+                    prof_prompt_tokens = prof.get("prompt_tokens") if isinstance(prof, dict) else None
+                    prof_completion_tokens = prof.get("tokens_generated") if isinstance(prof, dict) else None
+                    prompt_tokens = (
+                        int(prof_prompt_tokens)
+                        if isinstance(prof_prompt_tokens, int) and int(prof_prompt_tokens) > 0
+                        else _message_token_len(llm, messages, use_chat_template=bool(state.use_chat_template))
+                    )
+                    completion_tokens = (
+                        int(prof_completion_tokens)
+                        if isinstance(prof_completion_tokens, int) and int(prof_completion_tokens) > 0
+                        else _count_tokens(llm, out)
+                    )
                 if stream:
                     created = int(time.time())
                     stream_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
@@ -562,8 +829,6 @@ def make_handler(state: ServerState):
                     if not self._sse_write_json(first_chunk):
                         print(f"[client] disconnected during stream (role chunk): model={model_id}")
                         return
-                    impl = getattr(llm, "_impl", None) if llm is not None else None
-                    token_like_pieces = getattr(impl, "_last_stream_pieces", None) if impl is not None else None
                     if isinstance(token_like_pieces, list) and token_like_pieces:
                         pieces_iter = token_like_pieces
                     else:
@@ -634,6 +899,7 @@ def make_handler(state: ServerState):
                     },
                     "model_used": {"id": model_id, "mode": spec.mode, "source": spec.model_name_or_path},
                     "latency_ms": latency_ms,
+                    "queue_wait_ms": int(queue_wait_ms),
                     "tokens": prompt_tokens + completion_tokens,
                 }
                 sent = self._send_json(200, payload)
@@ -651,6 +917,12 @@ def make_handler(state: ServerState):
             except ValueError as exc:
                 self._dbg(f"response_status=400 error={exc}")
                 self._send_json(400, {"error": {"message": str(exc), "type": "invalid_request_error"}})
+            except OverloadedError as exc:
+                self._dbg(f"response_status=429 error={exc}")
+                self._send_json(429, {"error": {"message": str(exc), "type": "rate_limit_error"}})
+            except TimeoutError as exc:
+                self._dbg(f"response_status=504 error={exc}")
+                self._send_json(504, {"error": {"message": str(exc), "type": "timeout_error"}})
             except Exception as exc:
                 self._dbg(f"response_status=500 error={type(exc).__name__}: {exc}")
                 self._send_json(500, {"error": {"message": f"{type(exc).__name__}: {exc}", "type": "server_error"}})
@@ -670,22 +942,86 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--default_model", default="tiny-llm-7b")
     ap.add_argument("--no_chat_template", action="store_true")
     ap.add_argument("--no_preload_default", action="store_true", help="Disable default startup preload")
-    ap.add_argument("--warmup_tokens", type=int, default=16, help="Warmup generation tokens at startup (default: 16)")
+    ap.add_argument("--warmup_tokens", type=int, default=32, help="Warmup generation tokens at startup (default: 32)")
     ap.add_argument("--no_warmup", action="store_true", help="Disable startup warmup generation")
     ap.add_argument("--http_debug", action="store_true", help="Print HTTP request/response debug logs")
     ap.add_argument("--http_debug_max_chars", type=int, default=2000, help="Max chars to print for request/response bodies")
-    ap.add_argument("--max_prompt_tokens", type=int, default=1024, help="Max input prompt tokens (0 disables trimming)")
+    ap.add_argument(
+        "--max_prompt_tokens",
+        type=int,
+        default=0,
+        help="Max input prompt tokens. 0 enables auto-budget from model context window.",
+    )
+    ap.add_argument(
+        "--prompt_token_reserve",
+        type=int,
+        default=768,
+        help="Reserved tokens for completion/system overhead when max_prompt_tokens=0",
+    )
+    ap.add_argument(
+        "--max_prompt_tokens_auto_cap",
+        type=int,
+        default=4096,
+        help="Upper bound for auto prompt budget when max_prompt_tokens=0 (0 disables cap)",
+    )
     ap.add_argument("--fixed_response_text", default="", help="If set, bypass model and always return this text")
+    ap.add_argument(
+        "--quantization",
+        default="4bit",
+        choices=["auto", "none", "4bit", "8bit"],
+        help="Model quantization mode (requires bitsandbytes for 4/8-bit).",
+    )
+    ap.add_argument(
+        "--model_replicas",
+        type=int,
+        default=1,
+        help="Number of model replicas per model id (improves throughput, increases VRAM usage)",
+    )
+    ap.add_argument(
+        "--preload_all_replicas",
+        action="store_true",
+        help="When model_replicas>1, preload and warm all replicas at startup",
+    )
+    ap.add_argument(
+        "--queue_size_per_model",
+        type=int,
+        default=8,
+        help="Max queued requests per model before returning 429",
+    )
+    ap.add_argument(
+        "--request_timeout_s",
+        type=float,
+        default=300.0,
+        help="Generation wait timeout in seconds (default: 300)",
+    )
+    ap.add_argument(
+        "--attn_impl",
+        default="auto",
+        choices=["auto", "sdpa", "eager", "flash_attention_2"],
+        help="Attention implementation override for HF backend",
+    )
+    ap.add_argument("--torch_compile", action="store_true", help="Enable torch.compile for HF backend")
+    ap.add_argument("--no_tf32", action="store_true", help="Disable TF32 matmul/cudnn on CUDA")
+    ap.add_argument(
+        "--flash_only_sdp",
+        action="store_true",
+        help="Force SDPA to use flash kernels only (can greatly speed long-context prefill on supported GPUs)",
+    )
+    ap.add_argument(
+        "--no_flash_only_sdp",
+        action="store_true",
+        help="Disable flash-only SDPA override",
+    )
     ap.add_argument(
         "--max_completion_tokens_cap",
         type=int,
-        default=512,
+        default=160,
         help="Server-side hard cap for max_tokens requested by clients",
     )
     ap.add_argument(
         "--max_request_bytes",
         type=int,
-        default=32768,
+        default=16777216,
         help="Reject HTTP request bodies larger than this size (bytes)",
     )
     return ap.parse_args()
@@ -693,6 +1029,19 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    attn_impl = str(args.attn_impl or "auto").strip().lower()
+    if attn_impl != "auto":
+        os.environ["TINYLLM_ATTN_IMPL"] = attn_impl
+    if bool(args.torch_compile):
+        os.environ["TINYLLM_TORCH_COMPILE"] = "1"
+    if bool(args.no_tf32):
+        os.environ["TINYLLM_TF32"] = "0"
+    flash_only_sdp = True
+    if bool(args.no_flash_only_sdp):
+        flash_only_sdp = False
+    elif bool(args.flash_only_sdp):
+        flash_only_sdp = True
+    os.environ["TINYLLM_SDPA_FLASH_ONLY"] = "1" if flash_only_sdp else "0"
     registry = load_registry(str(args.registry_json))
     if not registry:
         raise SystemExit("No models available in registry.")
@@ -706,9 +1055,15 @@ def main() -> None:
         http_debug=bool(args.http_debug),
         http_debug_max_chars=int(args.http_debug_max_chars),
         max_prompt_tokens=int(args.max_prompt_tokens),
+        prompt_token_reserve=int(args.prompt_token_reserve),
+        max_prompt_tokens_auto_cap=int(args.max_prompt_tokens_auto_cap),
         fixed_response_text=str(args.fixed_response_text),
         max_completion_tokens_cap=int(args.max_completion_tokens_cap),
         max_request_bytes=int(args.max_request_bytes),
+        queue_size_per_model=int(args.queue_size_per_model),
+        request_timeout_s=float(args.request_timeout_s),
+        quantization=str(args.quantization),
+        model_replicas=int(args.model_replicas),
     )
     do_preload = (not bool(args.no_preload_default)) and (not bool(state.fixed_response_text))
     warmup_tokens = 0 if bool(args.no_warmup) else max(0, int(args.warmup_tokens))
@@ -716,19 +1071,37 @@ def main() -> None:
         try:
             model_id, spec = state.resolve_model(str(args.default_model))
             t0 = time.perf_counter()
-            llm = state.get_llm(
-                model_id=model_id,
-                spec=spec,
-                temperature=0.0,
-                max_new_tokens=max(16, warmup_tokens if warmup_tokens > 0 else 16),
-            )
+            _ = state.get_context_tokens(model_id=model_id, spec=spec)
             load_ms = int((time.perf_counter() - t0) * 1000)
             print(f"[startup] preloaded model={model_id} in {load_ms} ms")
             if warmup_tokens > 0:
                 w0 = time.perf_counter()
-                _ = llm.generate([{"role": "user", "content": "Reply with OK."}])
+                _ = state.generate(
+                    model_id=model_id,
+                    spec=spec,
+                    messages=[{"role": "user", "content": "Reply with OK."}],
+                    temperature=0.0,
+                    max_new_tokens=max(16, warmup_tokens),
+                )
                 warm_ms = int((time.perf_counter() - w0) * 1000)
                 print(f"[startup] warmup generate completed in {warm_ms} ms")
+            if bool(args.preload_all_replicas) and int(state.model_replicas) > 1:
+                pool = state.get_runtime_pool(model_id=model_id, spec=spec)
+                for ridx, runtime in enumerate(pool):
+                    t_rep0 = time.perf_counter()
+                    runtime.llm.ensure_loaded()
+                    rep_load_ms = int((time.perf_counter() - t_rep0) * 1000)
+                    print(f"[startup] replica={ridx} loaded in {rep_load_ms} ms")
+                    if warmup_tokens > 0:
+                        t_w = time.perf_counter()
+                        _ = runtime.submit(
+                            messages=[{"role": "user", "content": "Reply with OK."}],
+                            temperature=0.0,
+                            max_new_tokens=max(16, warmup_tokens),
+                            timeout_s=max(0.0, float(state.request_timeout_s)),
+                        )
+                        rep_warm_ms = int((time.perf_counter() - t_w) * 1000)
+                        print(f"[startup] replica={ridx} warmup in {rep_warm_ms} ms")
         except Exception as exc:
             print(f"[startup] preload failed: {type(exc).__name__}: {exc}")
     handler = make_handler(state)
@@ -736,6 +1109,16 @@ def main() -> None:
     print(f"Model API server listening on http://{args.host}:{args.port}")
     print("Endpoints: GET /health, GET /v1/models, POST /v1/chat/completions")
     print(f"Default model: {args.default_model}")
+    print(
+        f"Quantization={state.quantization} "
+        f"max_prompt_tokens={state.max_prompt_tokens or 'auto'} "
+        f"auto_cap={state.max_prompt_tokens_auto_cap or 'none'} "
+        f"queue_size_per_model={state.queue_size_per_model} "
+        f"replicas={state.model_replicas} "
+        f"attn_impl={os.environ.get('TINYLLM_ATTN_IMPL', 'auto')} "
+        f"torch_compile={os.environ.get('TINYLLM_TORCH_COMPILE', '0')} "
+        f"flash_only_sdp={os.environ.get('TINYLLM_SDPA_FLASH_ONLY', '0')}"
+    )
     print("[ready] server is ready to accept requests")
     httpd.serve_forever()
 
