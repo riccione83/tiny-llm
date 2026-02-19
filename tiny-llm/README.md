@@ -3,6 +3,8 @@
 This repository is now centered on the **7B workflow**.
 This README contains only the required steps to build and release the 7B model from scratch.
 
+Legacy/alternative runbooks (3B, advanced stack, code-review training) were moved to `tiny-llm/docs/archive/`.
+
 ## 1) Install
 
 ```powershell
