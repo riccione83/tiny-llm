@@ -1,11 +1,55 @@
-# Large training data files
-data/sources_v5/
+# Python caches and test artifacts
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+
+# OS and editor files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
+*.swp
+*.swo
+*~
+
+# Logs and temporary files
+*.log
+*.tmp
+*.bak
+_diag_*.log
+_longctx_*.log
+_bench_*.log
+
+# Large training/data artifacts at repository root
 data/
+data/sources_v5/
 finetuning/
 finetuning_v2/
 finetuning_v3_safe/
+/models/
+checkpoints_v2/
+checkpoints_v3/
+*.pt
+*.npy
 
-# Legacy local-training workspace (keep scripts, ignore heavy artifacts)
+# Legacy local-training workspace artifacts
 tiny-llm/data/
 tiny-llm/feedback/
 tiny-llm/finetuning/
@@ -18,52 +62,20 @@ tiny-llm/llm_tokenizer.vocab
 tiny-llm/models/
 tiny-llm/tools/
 
-rag_cache/
-/models/
-# Model checkpoints (large files)
-checkpoints_v3/
-checkpoints_v2/
-*.pt
-*.npy
+# Local experiments and comparison outputs
+tiny-llm/experiment/
+compare_*.json
+compare_*.txt
+compare_*.csv
+compare_*.log
+compare_*.py
 
+# Local helper folders
 feedback/
+rag_cache/
+deployment/
+local/
 
-# Keep tokenizer files (small, needed for code to work)
-!/llm_tokenizer.model
-!/llm_tokenizer.vocab
-
-# Python cache
-__pycache__/
-*.pyc
-*.pyo
-*.pyd
-.Python
-
-# Virtual environments
-venv/
-env/
-ENV/
-
-# IDE files
-.vscode/
-.idea/
-*.swp
-*.swo
-*~
-
-# OS files
-.DS_Store
-Thumbs.db
-desktop.ini
-
-# Logs
-*.log
-
-# Temporary files
-*.tmp
-*.bak
-*.swp
-
-# Planning documents
+# Planning notes
 SCALING_PLAN.md
 training_log.csv

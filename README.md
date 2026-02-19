@@ -1,146 +1,96 @@
-# Mini Assistant (Grounded Web QA)
+# tiny_LLM
 
-This repo supports two official paths:
+[![CI](https://github.com/riccione83/tiny-llm/actions/workflows/ci.yml/badge.svg)](https://github.com/riccione83/tiny-llm/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-- `mini_assistant/` (recommended): grounded QA with web retrieval.
-- `tiny-llm/`: full local end-to-end training pipeline.
+Production-ready local LLM workspace with two official paths:
 
-Use `mini_assistant/` if you want immediate quality and simpler setup.
-Use `tiny-llm/` if you want to train everything locally from scratch.
+- `mini_assistant/` (recommended): grounded Q&A with web retrieval and a simple CLI.
+- `tiny-llm/`: full training and release pipeline (LoRA/QLoRA, evaluation, LM Studio export).
 
-## tiny-llm Status
+The repository is organized for repeatability and public readability: quick onboarding at root, detailed runbooks in `tiny-llm/`.
 
-The `tiny-llm` pipeline is now centered on the **7B workflow** (`Qwen/Qwen2.5-7B-Instruct` + LoRA/QLoRA).
-Use `tiny-llm/README.md` for the official minimal 7B runbook.
+## Repository Layout
 
-## Path A (Recommended): Ready Model + Grounded QA
+```text
+.
+|-- mini_assistant/         # Runtime assistant package (chat, routing, retrieval, evals)
+|-- tiny-llm/               # Training/eval/release pipeline and datasets samples
+|-- model_api_server.py     # OpenAI-compatible local API server
+|-- eval.py                 # Unified evaluation entrypoint (grounded/chat/both)
+|-- scripts/                # Operational helper scripts
+|-- requirements.txt
+`-- README.md
+```
 
-- LLM: `Qwen/Qwen3-4B-Instruct-2507`
-- Retriever embeddings: `sentence-transformers/all-MiniLM-L6-v2`
-- Runtime package: `mini_assistant/`
-- Optional local backend: your custom tiny checkpoint from `legacy_chat.py` (legacy custom model backend)
+## Quick Start (Recommended Path)
 
-## Quick Start
+### 1) Install dependencies
 
 ```powershell
 python -m pip install -U pip
 python -m pip install -r requirements.txt
 ```
 
-## Local OpenAI-Compatible API (Model Switch: base/lora)
-
-Run a local API server:
-
-```powershell
-python .\model_api_server.py --host 127.0.0.1 --port 8001 --default_model tiny-llm-7b
-```
-
-List available models:
-
-```powershell
-Invoke-RestMethod http://127.0.0.1:8001/v1/models | ConvertTo-Json -Depth 5
-```
-
-Chat completion request:
-
-```powershell
-$body = @{
-  model = "tiny-llm-7b"
-  messages = @(
-    @{ role = "user"; content = "Fix this code: def add(a,b): return a-b" }
-  )
-  temperature = 0.2
-  max_tokens = 300
-} | ConvertTo-Json -Depth 6
-
-Invoke-RestMethod -Uri "http://127.0.0.1:8001/v1/chat/completions" -Method Post -ContentType "application/json" -Body $body | ConvertTo-Json -Depth 8
-```
-
-The response includes OpenAI-style `choices` plus:
-- `model_used` (selected model id + source path)
-- `latency_ms`
-- `tokens`
-
-Run chat (search web automatically):
+### 2) Start the grounded assistant
 
 ```powershell
 python -m mini_assistant.chat --backend hf --model_name Qwen/Qwen3-4B-Instruct-2507 --embedding_model sentence-transformers/all-MiniLM-L6-v2 --temperature 0.0
 ```
 
-Show routing/debug (`direct` vs `web`):
+### 3) Optional: start local OpenAI-compatible API
 
 ```powershell
-python -m mini_assistant.chat --show_debug --direct_confidence_threshold 0.72
+python .\model_api_server.py --host 127.0.0.1 --port 8001 --default_model tiny-llm-7b
 ```
 
-Run chat on a fixed URL:
+Quick smoke test:
 
 ```powershell
-python -m mini_assistant.chat --backend hf --url https://en.wikipedia.org/wiki/Italy
+.\scripts\api_smoke_test.ps1
 ```
 
-## Path B: Local End-to-End Training (No External Base LLM)
+## Evaluation
 
-Training is now a modern minimal 4-script pipeline in `tiny-llm/`:
-
-```powershell
-cd tiny-llm
-python .\01_download_base.py --model_id Qwen/Qwen2.5-0.5B-Instruct --output_dir models/base
-python .\02_train_base.py --model_dir models/base --output_dir models/base_trained --recipe knowledge-heavy --max_steps 30000 --repeat_sources --gradient_checkpointing
-python .\03_download_lora_base.py --model_id Qwen/Qwen3-4B-Instruct-2507 --output_dir models/lora_base
-python .\04_train_lora.py --model_dir models/lora_base --output_dir models/lora_adapter --recipe heavy --max_steps 8000 --repeat_sources --gradient_checkpointing --save_merged
-```
-
-Production repair/release path (LM Studio ready):
+Run the compatibility wrapper:
 
 ```powershell
-cd tiny-llm
-.\run_lora_targeted_repair.ps1 -ModelDir models/base_trained -SeedAdapter models/lora_repair_v1/checkpoint-900 -OutDir models/lora_repair_v2
-python .\05_eval_lora_checkpoints.py --base_model_dir models/base_trained --adapter_dir models/lora_repair_v2 --max_checkpoints 6 --out_json models/lora_repair_v2/checkpoint_eval_report.json
-.\release_lmstudio.ps1 -BaseModelDir models/base_trained -AdapterDir models/lora_repair_v2 -ReleaseName tyny-lm-release2 -CleanupOldCheckpoints -CleanupOldLmStudioModels
-```
-
-Full details and options: `tiny-llm/README.md`.
-Built-in local samples are in `tiny-llm/samples/` and are loaded by default in both training scripts.
-
-Run regression eval:
-
-```powershell
-# Grounded (web QA) regression:
 python .\eval.py --suite grounded --backend hf --model_name Qwen/Qwen3-4B-Instruct-2507 --embedding_model sentence-transformers/all-MiniLM-L6-v2
-
-# Offline chat sanity (no web):
 python .\eval.py --suite chat --backend hf --model_name Qwen/Qwen3-4B-Instruct-2507
 ```
 
-Run confidence-gate check:
+Run unit tests:
 
 ```powershell
-python -m mini_assistant.eval_confidence_gate --backend hf --model_name Qwen/Qwen3-4B-Instruct-2507 --embedding_model sentence-transformers/all-MiniLM-L6-v2 --direct_confidence_threshold 0.72
+python -m unittest discover -s tiny-llm/tests -p "test_*.py"
 ```
 
-## Notes
+Or use helper script:
 
-- The new entrypoint for practical usage is `mini_assistant/chat.py`.
-- Best quality today is with `--backend hf` (`Qwen/Qwen3-4B-Instruct-2507`).
-- `--backend tiny` is legacy/optional and requires you to provide your own custom checkpoint artifacts.
+```powershell
+.\scripts\check.ps1
+```
 
-## What To Ask
+## Training and Release (Advanced)
 
-These prompts are known-good for current setups.
+The official 7B runbook lives in `tiny-llm/README.md`.
 
-Mini Assistant (`mini_assistant/chat.py`) examples:
+That path includes:
+- base model download
+- LoRA/QLoRA training
+- checkpoint ranking
+- regression suite
+- LM Studio release packaging
 
-- `What is the VRAM of NVIDIA RTX 5070 Ti? Use official sources only.`
-- `What is the latest NVIDIA GPU line?`
-- `/url https://en.wikipedia.org/wiki/Italy` then ask: `What is the official language?`
-- `/url https://en.wikipedia.org/wiki/Italy` then ask: `Summarize the key points in 3 bullets.`
+## Legacy Compatibility
 
-tiny-llm 7B (`tyny-lm-7b-release1` in LM Studio) examples:
+- `legacy_chat.py` is retained for legacy tiny-checkpoint flows.
+- `mini_assistant --backend tiny` depends on legacy artifacts and is optional.
 
-- `Write a Python function is_prime(n). Return only a fenced python block.`
-- `Return ONLY valid JSON {"language": string, "has_code": boolean, "code": string}. Task: write add(a,b).`
-- `Give exactly 3 bullets on the risks of fine-tuning with small datasets.`
-- `Compute 47*19. Reply with: "<number>. <one short sentence>".`
-- `Write a TypeScript function quicksort(arr: number[]): number[]. Output only fenced ts.`
-- `Remember this information. My name is Riccardo.` then: `What is my name?`
+## Contributing
+
+Contribution workflow and quality expectations are documented in `CONTRIBUTING.md`.
+
+## License
+
+This project is licensed under the MIT License. See `LICENSE`.

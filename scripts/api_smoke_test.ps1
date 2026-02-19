@@ -1,42 +1,35 @@
-$hostBase = "http://127.0.0.1:8001"
-$chatUrl = "$hostBase/v1/chat/completions"
+param(
+    [string]$BaseUrl = "http://127.0.0.1:8001",
+    [string[]]$Models = @("tiny-llm-7b")
+)
 
-# 1) Prendi tutti i modelli disponibili
-$allModels = (Invoke-RestMethod "$hostBase/v1/models").data.id
+$ErrorActionPreference = "Stop"
 
-# 2) Seleziona SOLO quelli che vuoi testare
-# $modelsToTest = $allModels | Where-Object {
-#     $_ -in @("tiny-llm-0.5b","tiny-llm-3b","tiny-llm-7b","base-qwen-0.5b","base-qwen-3b")
-# }
+$chatUrl = "$BaseUrl/v1/chat/completions"
+$modelsUrl = "$BaseUrl/v1/models"
 
-$modelsToTest = $allModels | Where-Object {
-    $_ -in @("tiny-llm-7b")
-}
-
-
-# 3) Funzione per chiamare il modello
-function Ask($model, $content, $temp=0.2, $max=200) {
+function Invoke-ModelChat([string]$Model, [string]$Prompt, [double]$Temperature = 0.2, [int]$MaxTokens = 200) {
     $body = @{
-        model = $model
-        messages = @(@{ role="user"; content=$content })
-        temperature = $temp
-        max_tokens = $max
+        model = $Model
+        messages = @(@{ role = "user"; content = $Prompt })
+        temperature = $Temperature
+        max_tokens = $MaxTokens
     } | ConvertTo-Json -Depth 6
 
     try {
-        $resp = Invoke-RestMethod -Uri $chatUrl -Method Post -ContentType "application/json" -Body $body -ErrorAction Stop
+        $resp = Invoke-RestMethod -Uri $chatUrl -Method Post -ContentType "application/json" -Body $body
         if ($null -ne $resp.choices -and $resp.choices.Count -gt 0) {
             return @{
                 ok = $true
-                content = $resp.choices[0].message.content
                 model = $resp.model
                 latency_ms = $resp.latency_ms
                 tokens = $resp.tokens
+                content = $resp.choices[0].message.content
             }
         }
         return @{
             ok = $false
-            error = "Missing choices in response"
+            error = "Missing choices in API response."
             raw = $resp
         }
     } catch {
@@ -51,12 +44,21 @@ function Ask($model, $content, $temp=0.2, $max=200) {
     }
 }
 
-# 4) Test suite
+$available = @((Invoke-RestMethod $modelsUrl).data.id)
+$selected = @($available | Where-Object { $_ -in $Models })
+
+if ($selected.Count -eq 0) {
+    Write-Host "[ERROR] None of the requested models are exposed by $BaseUrl"
+    Write-Host "Requested: $($Models -join ', ')"
+    Write-Host "Available: $($available -join ', ')"
+    exit 1
+}
+
 $tests = @(
     @{
         name = "JSON strict"
         prompt = 'Return ONLY valid JSON {"sum": number}. Task: sum 4 and 5'
-        temp = 0
+        temp = 0.0
         max = 80
     },
     @{
@@ -68,7 +70,7 @@ $tests = @(
     @{
         name = "Bug reasoning"
         prompt = @"
-where is the issue here?
+Where is the issue here?
 
 def is_prime(n: int) -> bool:
     if n <= 1:
@@ -82,26 +84,21 @@ def is_prime(n: int) -> bool:
         max = 200
     },
     @{
-        name = "hard reasoning"
-        prompt = @"
-Return ONLY valid JSON with keys: language (string), has_code (boolean), code (string). Task: write add(a,b) in Python. No markdown.
-"@
+        name = "Structured output"
+        prompt = 'Return ONLY valid JSON with keys: language (string), has_code (boolean), code (string). Task: write add(a,b) in Python. No markdown.'
         temp = 0.1
         max = 200
     }
-
 )
 
-# 5) Loop su modelli e test
-foreach ($m in $modelsToTest) {
-
+foreach ($model in $selected) {
     Write-Host "`n==============================="
-    Write-Host "MODEL: $m"
+    Write-Host "MODEL: $model"
     Write-Host "==============================="
 
-    foreach ($t in $tests) {
-        Write-Host "`n--- $($t.name) ---"
-        $result = Ask $m $t.prompt $t.temp $t.max
+    foreach ($test in $tests) {
+        Write-Host "`n--- $($test.name) ---"
+        $result = Invoke-ModelChat -Model $model -Prompt $test.prompt -Temperature $test.temp -MaxTokens $test.max
         if ($result.ok) {
             Write-Host ("[OK] model={0} latency_ms={1} tokens={2}" -f $result.model, $result.latency_ms, $result.tokens)
             Write-Host $result.content
