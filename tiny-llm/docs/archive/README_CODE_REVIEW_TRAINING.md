@@ -143,15 +143,15 @@ One-command pipeline script:
 
 ```powershell
 cd tiny-llm
-.\run_3b_programming_review.ps1
+.\scripts\run_3b_programming_review.ps1
 ```
 
 Useful variants:
 
 ```powershell
 cd tiny-llm
-.\run_3b_programming_review.ps1 -SkipDownloadBase
-.\run_3b_programming_review.ps1 -SkipDownloadBase -SkipCpt
+.\scripts\run_3b_programming_review.ps1 -SkipDownloadBase
+.\scripts\run_3b_programming_review.ps1 -SkipDownloadBase -SkipCpt
 ```
 
 Generate/refresh synthetic review data:
@@ -172,15 +172,15 @@ This pipeline adds:
 
 ```powershell
 cd tiny-llm
-.\run_3b_code_assistant_max.ps1
+.\scripts\run_3b_code_assistant_max.ps1
 ```
 
 Useful variants:
 
 ```powershell
 cd tiny-llm
-.\run_3b_code_assistant_max.ps1 -SkipDownloadBase
-.\run_3b_code_assistant_max.ps1 -SkipDownloadBase -SkipCpt
+.\scripts\run_3b_code_assistant_max.ps1 -SkipDownloadBase
+.\scripts\run_3b_code_assistant_max.ps1 -SkipDownloadBase -SkipCpt
 ```
 
 Dedicated code-assistant benchmark prompts:

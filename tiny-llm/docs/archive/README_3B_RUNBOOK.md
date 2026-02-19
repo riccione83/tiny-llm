@@ -137,7 +137,7 @@ Replace `checkpoint-XXX` with your selected best checkpoint.
 
 ```powershell
 cd tiny-llm
-.\run_lora_targeted_repair.ps1 `
+.\scripts\run_lora_targeted_repair.ps1 `
   -ModelDir models/lora_base_3b `
   -SeedAdapter models/lora3b_seed_v1/checkpoint-XXX `
   -OutDir models/lora3b_repair_v1 `
@@ -161,7 +161,7 @@ Replace `checkpoint-YYY` with the promoted checkpoint.
 
 ```powershell
 cd tiny-llm
-.\release_lmstudio.ps1 `
+.\scripts\release_lmstudio.ps1 `
   -BaseModelDir models/lora_base_3b `
   -AdapterDir models/lora3b_repair_v1 `
   -Checkpoint checkpoint-YYY `
@@ -176,7 +176,7 @@ Once validated, freeze the same checkpoint under a stable release name:
 
 ```powershell
 cd tiny-llm
-.\release_lmstudio.ps1 `
+.\scripts\release_lmstudio.ps1 `
   -BaseModelDir models/lora_base_3b `
   -AdapterDir models/lora3b_repair_v1 `
   -Checkpoint checkpoint-420 `

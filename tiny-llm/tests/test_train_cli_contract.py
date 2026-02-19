@@ -14,7 +14,7 @@ class TrainCliContractTests(unittest.TestCase):
         self.assertIsNotNone(m, "--local_jsonl_glob must remain argparse append mode")
 
     def test_targeted_repair_script_passes_multiple_local_globs(self):
-        text = Path("tiny-llm/run_lora_targeted_repair.ps1").read_text(encoding="utf-8")
+        text = Path("tiny-llm/scripts/run_lora_targeted_repair.ps1").read_text(encoding="utf-8")
         # Support both backtick-style CLI invocation and args-array invocation.
         hits = re.findall(r"--local_jsonl_glob", text)
         self.assertGreaterEqual(
@@ -31,7 +31,7 @@ class TrainCliContractTests(unittest.TestCase):
         self.assertIn("--bnb_4bit_use_double_quant", text)
 
     def test_targeted_repair_script_exposes_optional_qlora_switches(self):
-        text = Path("tiny-llm/run_lora_targeted_repair.ps1").read_text(encoding="utf-8")
+        text = Path("tiny-llm/scripts/run_lora_targeted_repair.ps1").read_text(encoding="utf-8")
         self.assertIn("$Use4Bit", text)
         self.assertIn("--use_4bit", text)
 

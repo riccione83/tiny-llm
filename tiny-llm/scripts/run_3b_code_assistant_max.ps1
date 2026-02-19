@@ -19,7 +19,8 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
-Push-Location $PSScriptRoot
+$ProjectRoot = Split-Path -Parent $PSScriptRoot
+Push-Location $ProjectRoot
 
 # Keep runtime conservative on 16GB VRAM:
 # - disable dynamo graph compilation (can spike memory)
@@ -32,7 +33,7 @@ if ([string]::IsNullOrWhiteSpace($env:PYTORCH_ALLOC_CONF)) {
 function Resolve-LocalPath([string]$p) {
   if ([string]::IsNullOrWhiteSpace($p)) { return $p }
   if ([System.IO.Path]::IsPathRooted($p)) { return $p }
-  return (Join-Path $PSScriptRoot $p)
+  return (Join-Path $ProjectRoot $p)
 }
 
 function Get-TopCheckpointsFromEvalReport([string]$reportPath, [int]$topK) {
@@ -211,7 +212,7 @@ if (-not $SkipSeed) {
 
 $bestRepair = $null
 if ((-not $SkipRepair) -and ($null -ne $bestSeed) -and (-not [string]::IsNullOrWhiteSpace([string]$bestSeed.AdapterDir))) {
-  & .\run_lora_targeted_repair.ps1 `
+  & .\scripts\run_lora_targeted_repair.ps1 `
     -ModelDir "$CptDir" `
     -SeedAdapter "$($bestSeed.AdapterDir)" `
     -OutDir "$RepairDir" `

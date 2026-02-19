@@ -9,6 +9,8 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+$ProjectRoot = Split-Path -Parent $PSScriptRoot
+Push-Location $ProjectRoot
 
 Write-Host "LoRA SFT run"
 Write-Host "  ModelDir : $ModelDir"
@@ -43,3 +45,5 @@ python .\04_train_lora.py `
   --sample_eval_prompt "User: Write a short checklist (5 items) for debugging a Python bug.`n`nAssistant:" `
   --sample_eval_prompt "User: Risolvi: 18*7. Rispondi con il numero e una breve spiegazione.`n`nAssistant:" `
   --sample_eval_prompt "User: Se tutti i gatti sono mammiferi e tutti i mammiferi respirano, i gatti respirano? Rispondi si/no e 1 riga.`n`nAssistant:"
+
+Pop-Location

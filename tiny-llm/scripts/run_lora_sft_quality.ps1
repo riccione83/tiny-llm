@@ -13,6 +13,8 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+$ProjectRoot = Split-Path -Parent $PSScriptRoot
+Push-Location $ProjectRoot
 
 function Get-LatestCheckpoint([string]$dirPath) {
   if (-not (Test-Path $dirPath)) { return $null }
@@ -93,3 +95,4 @@ Write-Host ""
 Write-Host "Quality run complete."
 Write-Host "Merged model (if successful): $OutDir\\merged_model"
 
+Pop-Location

@@ -121,11 +121,11 @@ Auto routing policy:
 
 ## Optional: QLoRA targeted repair script
 
-You can reuse `run_lora_targeted_repair.ps1` with optional 4-bit flags:
+You can reuse `scripts/run_lora_targeted_repair.ps1` with optional 4-bit flags:
 
 ```powershell
 cd tiny-llm
-.\run_lora_targeted_repair.ps1 `
+.\scripts\run_lora_targeted_repair.ps1 `
   -ModelDir models/lora_base_7b `
   -SeedAdapter models/lora7b_seed_v1/checkpoint-300 `
   -OutDir models/lora7b_repair_v1 `

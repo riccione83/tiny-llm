@@ -18,14 +18,15 @@ param(
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
 
-Push-Location $PSScriptRoot
+$ProjectRoot = Split-Path -Parent $PSScriptRoot
+Push-Location $ProjectRoot
 
 function Resolve-LocalPath([string]$p) {
   if ([string]::IsNullOrWhiteSpace($p)) { return $p }
   if ([System.IO.Path]::IsPathRooted($p)) {
     return [System.IO.Path]::GetFullPath($p)
   }
-  return [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot $p))
+  return [System.IO.Path]::GetFullPath((Join-Path $ProjectRoot $p))
 }
 
 function Get-CheckpointStep([string]$ckptPath) {

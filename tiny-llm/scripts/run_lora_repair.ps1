@@ -18,12 +18,13 @@ param(
 
 $ErrorActionPreference = "Stop"
 
-Push-Location $PSScriptRoot
+$ProjectRoot = Split-Path -Parent $PSScriptRoot
+Push-Location $ProjectRoot
 
 function Resolve-LocalPath([string]$p) {
   if ([string]::IsNullOrWhiteSpace($p)) { return $p }
   if ([System.IO.Path]::IsPathRooted($p)) { return $p }
-  return (Join-Path $PSScriptRoot $p)
+  return (Join-Path $ProjectRoot $p)
 }
 
 function Get-LatestCheckpoint([string]$dirPath) {

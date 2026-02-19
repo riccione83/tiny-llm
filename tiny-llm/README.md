@@ -5,6 +5,8 @@ This README contains only the required steps to build and release the 7B model f
 
 Legacy/alternative runbooks (3B, advanced stack, code-review training) were moved to `tiny-llm/docs/archive/`.
 
+Operational PowerShell launchers are now under `tiny-llm/scripts/`.
+
 ## 1) Install
 
 ```powershell
@@ -77,7 +79,7 @@ python .\regression_suite.py --backend hf --model_dir models/lora_base_7b --adap
 
 ```powershell
 cd tiny-llm
-.\release_lmstudio.ps1 `
+.\scripts\release_lmstudio.ps1 `
   -BaseModelDir models/lora_base_7b `
   -AdapterDir models/lora7b_seed_v1 `
   -Checkpoint checkpoint-300 `

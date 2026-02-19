@@ -15,12 +15,13 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
-Push-Location $PSScriptRoot
+$ProjectRoot = Split-Path -Parent $PSScriptRoot
+Push-Location $ProjectRoot
 
 function Resolve-LocalPath([string]$p) {
   if ([string]::IsNullOrWhiteSpace($p)) { return $p }
   if ([System.IO.Path]::IsPathRooted($p)) { return $p }
-  return (Join-Path $PSScriptRoot $p)
+  return (Join-Path $ProjectRoot $p)
 }
 
 $BaseDir = Resolve-LocalPath $BaseDir
@@ -156,6 +157,6 @@ Write-Host "Pipeline complete."
 Write-Host "Next:"
 Write-Host "  1) Inspect: $LoraDir/checkpoint_eval_report.json"
 Write-Host "  2) Inspect: $LoraDir/code_assistant_eval_report.json"
-Write-Host "  3) Promote best checkpoint and merge with 06_merge_lora_checkpoint.py or release_lmstudio.ps1"
+Write-Host "  3) Promote best checkpoint and merge with 06_merge_lora_checkpoint.py or scripts/release_lmstudio.ps1"
 
 Pop-Location
