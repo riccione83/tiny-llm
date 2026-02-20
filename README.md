@@ -31,6 +31,11 @@ The repository is organized for repeatability and public readability: quick onbo
 python .\quickstart.py
 ```
 
+Cross-platform note:
+- Training/SFT flows are designed to run on Windows, Linux, and macOS (Python-based paths).
+- QLoRA 4-bit requires CUDA + bitsandbytes; on macOS/Linux without CUDA, use standard LoRA.
+- Release packaging (`tiny-llm/scripts/release_lmstudio.ps1`) is intentionally Windows-only.
+
 Useful non-interactive variants:
 
 ```powershell

@@ -13,6 +13,8 @@ Interactive launcher for common repo workflows with:
 from __future__ import annotations
 
 import argparse
+import functools
+import json
 import os
 import platform
 import shlex
@@ -174,6 +176,57 @@ def resolve_ps_exec() -> Optional[str]:
         if ps:
             return ps
     return None
+
+
+def has_powershell_runtime() -> bool:
+    return resolve_ps_exec() is not None
+
+
+@functools.lru_cache(maxsize=1)
+def detect_torch_backends() -> Tuple[Optional[bool], Optional[bool]]:
+    probe = (
+        "import json\n"
+        "try:\n"
+        " import torch\n"
+        " cuda = bool(torch.cuda.is_available())\n"
+        " mps_backend = getattr(torch.backends, 'mps', None)\n"
+        " mps = bool(mps_backend and mps_backend.is_available())\n"
+        " print(json.dumps({'cuda': cuda, 'mps': mps}))\n"
+        "except Exception:\n"
+        " print('{}')\n"
+    )
+    try:
+        proc = subprocess.run(
+            [sys.executable, "-c", probe],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=8,
+        )
+    except Exception:
+        return None, None
+    if int(proc.returncode) != 0:
+        return None, None
+    raw = (proc.stdout or "").strip()
+    if not raw:
+        return None, None
+    try:
+        data = json.loads(raw.splitlines()[-1].strip())
+    except Exception:
+        return None, None
+    return bool(data.get("cuda", False)), bool(data.get("mps", False))
+
+
+def has_cuda_runtime() -> bool:
+    cuda, _ = detect_torch_backends()
+    return bool(cuda)
+
+
+def preferred_train_dtype() -> str:
+    cuda, mps = detect_torch_backends()
+    if cuda is True or mps is True:
+        return "float16"
+    return "auto"
 
 
 def has_committed_files(root: Path, rel_path: str) -> bool:
@@ -437,7 +490,7 @@ def plan_download_05b(root: Path) -> Plan:
                 "--output_dir",
                 "models/base",
                 "--dtype",
-                "float16",
+                "auto",
             )
         ],
     )
@@ -456,7 +509,7 @@ def plan_download_3b(root: Path) -> Plan:
                 "--output_dir",
                 "models/base_3b",
                 "--dtype",
-                "float16",
+                "auto",
             )
         ],
     )
@@ -475,7 +528,7 @@ def plan_download_7b_lora(root: Path) -> Plan:
                 "--output_dir",
                 "models/lora_base_7b",
                 "--dtype",
-                "float16",
+                "auto",
             )
         ],
     )
@@ -542,7 +595,7 @@ def plan_train_base_3b(root: Path) -> Plan:
                 "512,768,1024",
                 "--gradient_checkpointing",
                 "--dtype",
-                "float16",
+                "auto",
                 "--logging_steps",
                 "20",
                 "--save_steps",
@@ -592,6 +645,7 @@ def plan_train_base_custom(root: Path) -> Plan:
 
 
 def plan_train_lora_7b(root: Path) -> Plan:
+    use_4bit = has_cuda_runtime()
     args = [
         "04_train_lora.py",
         "--model_dir",
@@ -634,12 +688,7 @@ def plan_train_lora_7b(root: Path) -> Plan:
         "3e-5",
         "--gradient_checkpointing",
         "--dtype",
-        "float16",
-        "--use_4bit",
-        "--bnb_4bit_quant_type",
-        "nf4",
-        "--bnb_4bit_compute_dtype",
-        "float16",
+        preferred_train_dtype(),
         "--logging_steps",
         "20",
         "--save_steps",
@@ -647,7 +696,17 @@ def plan_train_lora_7b(root: Path) -> Plan:
         "--save_total_limit",
         "6",
     ]
-    return Plan(title="Train LoRA 7B", description="Official 7B seed QLoRA preset.", commands=[p_cmd(root / "tiny-llm", *args)])
+    warnings: List[str] = []
+    if use_4bit:
+        args.extend(["--use_4bit", "--bnb_4bit_quant_type", "nf4", "--bnb_4bit_compute_dtype", "auto"])
+    else:
+        warnings.append("CUDA not detected: running LoRA preset without 4-bit QLoRA flags.")
+    return Plan(
+        title="Train LoRA 7B",
+        description="Official 7B seed preset (QLoRA enabled when CUDA is available).",
+        commands=[p_cmd(root / "tiny-llm", *args)],
+        warnings=warnings,
+    )
 
 
 def plan_train_lora_3b(root: Path) -> Plan:
@@ -692,7 +751,7 @@ def plan_train_lora_3b(root: Path) -> Plan:
                 "4e-5",
                 "--gradient_checkpointing",
                 "--dtype",
-                "float16",
+                preferred_train_dtype(),
             )
         ],
     )
@@ -726,21 +785,30 @@ def plan_train_lora_custom(root: Path) -> Plan:
         "--learning_rate",
         str(lr),
         "--dtype",
-        "float16",
+        preferred_train_dtype(),
     ]
+    warnings: List[str] = []
     if prompt_bool("Disable HF data?", True):
         args.append("--disable_hf_data")
     if prompt_bool("Validate data?", True):
         args.append("--validate_data")
-    if prompt_bool("Use 4-bit QLoRA?", True):
-        args.extend(["--use_4bit", "--bnb_4bit_quant_type", "nf4", "--bnb_4bit_compute_dtype", "float16"])
+    ask_4bit = prompt_bool("Use 4-bit QLoRA (CUDA only)?", has_cuda_runtime())
+    if ask_4bit and has_cuda_runtime():
+        args.extend(["--use_4bit", "--bnb_4bit_quant_type", "nf4", "--bnb_4bit_compute_dtype", "auto"])
+    elif ask_4bit:
+        warnings.append("CUDA not detected: skipped --use_4bit to avoid unsupported configuration.")
     globs = prompt_str(
         "Local JSONL globs comma-separated",
         "samples/sft/repair_math_logic_coding.jsonl,samples/sft/system_styles.jsonl,samples/sft/chat_alignment_samples.jsonl",
     )
     for g in [x.strip() for x in globs.split(",") if x.strip()]:
         args.extend(["--local_jsonl_glob", g])
-    return Plan(title="Train LoRA custom", description="Interactive custom LoRA/QLoRA training.", commands=[p_cmd(root / "tiny-llm", *args)])
+    return Plan(
+        title="Train LoRA custom",
+        description="Interactive custom LoRA/QLoRA training.",
+        commands=[p_cmd(root / "tiny-llm", *args)],
+        warnings=warnings,
+    )
 
 
 def plan_eval_checkpoints(root: Path) -> Plan:
@@ -786,7 +854,23 @@ def plan_ps_script(root: Path, script_name: str, title: str, desc: str) -> Plan:
         title=title,
         description=desc,
         commands=[ps1_cmd(root / "tiny-llm", f"scripts/{script_name}")],
-        warnings=["Requires PowerShell (`pwsh`/`powershell`)."],
+        warnings=[
+            "Requires PowerShell (`pwsh`/`powershell`).",
+            "For cross-platform training/SFT use Python flows under tiny-llm Train Base / Train LoRA menus.",
+        ],
+    )
+
+
+def plan_ps_release_windows_only(root: Path) -> Optional[Plan]:
+    if not on_windows():
+        print("release_lmstudio.ps1 is Windows-only by design.")
+        print("Use Windows for release packaging; training/SFT remains cross-platform via Python commands.")
+        return None
+    return plan_ps_script(
+        root,
+        "release_lmstudio.ps1",
+        "release_lmstudio.ps1",
+        "PowerShell workflow (Windows-only release packaging).",
     )
 
 
@@ -880,11 +964,27 @@ def build_actions(root: Path) -> Dict[str, Action]:
     reg("tiny.ps.targeted", "run_lora_targeted_repair.ps1", "PowerShell workflow", lambda r: plan_ps_script(r, "run_lora_targeted_repair.ps1", "run_lora_targeted_repair.ps1", "PowerShell workflow"))
     reg("tiny.ps.3b", "run_3b_programming_review.ps1", "PowerShell workflow", lambda r: plan_ps_script(r, "run_3b_programming_review.ps1", "run_3b_programming_review.ps1", "PowerShell workflow"))
     reg("tiny.ps.3bmax", "run_3b_code_assistant_max.ps1", "PowerShell workflow", lambda r: plan_ps_script(r, "run_3b_code_assistant_max.ps1", "run_3b_code_assistant_max.ps1", "PowerShell workflow"))
-    reg("tiny.ps.release", "release_lmstudio.ps1", "PowerShell workflow", lambda r: plan_ps_script(r, "release_lmstudio.ps1", "release_lmstudio.ps1", "PowerShell workflow"))
+    reg("tiny.ps.release", "release_lmstudio.ps1", "Windows-only release workflow", plan_ps_release_windows_only)
     reg("rag.local", "Run RAG router local", "interactive local mode", plan_rag_local)
     reg("rag.auto", "Run RAG router auto", "interactive auto mode", plan_rag_auto)
     reg("util.custom.py", "Run custom Python command", "interactive custom command", plan_custom_python)
     reg("util.custom.sh", "Run custom shell command", "interactive custom command", plan_custom_shell)
+    reg(
+        "util.cross_platform_notes",
+        "Show cross-platform notes",
+        "Print OS support notes for training/SFT/release",
+        lambda r: Plan(
+            title="Cross-platform support notes",
+            description="Training and SFT are cross-platform. Release is Windows-only.",
+            commands=[],
+            warnings=[
+                "Cross-platform: download/train/eval flows based on Python scripts.",
+                "Windows-only: tiny-llm/scripts/release_lmstudio.ps1",
+                "QLoRA 4-bit paths require CUDA + bitsandbytes; on macOS/Linux without CUDA use standard LoRA.",
+                "PowerShell wrappers may run with pwsh on Unix, but only release is intentionally Windows-only.",
+            ],
+        ),
+    )
     return a
 
 
@@ -908,7 +1008,7 @@ def maybe_experiment_menu(root: Path, actions: Dict[str, Action]) -> Optional[Me
 
 def build_menu(root: Path, actions: Dict[str, Action]) -> Menu:
     root_menu = Menu("Main Menu", "Select a functionality area.")
-    root_menu.items = [
+    items: List[Tuple[str, Union[Menu, Action]]] = [
         ("Environment Setup", Menu("Environment Setup", "Bootstrap and inspect repository.", [("Install requirements", actions["env.install"]), ("Show structure", actions["env.structure"])])),
         ("Mini Assistant", Menu("Mini Assistant", "Grounded QA runtime.", [("Run grounded chat", actions["mini.chat"]), ("Run grounded chat (debug)", actions["mini.chat.debug"]), ("Run chat on fixed URL", actions["mini.chat.url"]), ("Run direct chat", actions["mini.direct"])])),
         ("Model API Server", Menu("Model API Server", "OpenAI-compatible local API.", [("Start server default", actions["api.server.default"]), ("Start server custom", actions["api.server.custom"]), ("Run API smoke test", actions["api.smoke"])])),
@@ -917,13 +1017,33 @@ def build_menu(root: Path, actions: Dict[str, Action]) -> Menu:
         ("tiny-llm Train Base", Menu("tiny-llm Train Base", "Base model training.", [("Train 0.5B preset", actions["tiny.train.base.05b"]), ("Train 3B preset", actions["tiny.train.base.3b"]), ("Train with your parameters", actions["tiny.train.base.custom"])])),
         ("tiny-llm Train LoRA", Menu("tiny-llm Train LoRA", "LoRA/QLoRA workflows.", [("Train 3B preset", actions["tiny.train.lora.3b"]), ("Train 7B preset", actions["tiny.train.lora.7b"]), ("Train with your parameters", actions["tiny.train.lora.custom"])])),
         ("tiny-llm Eval/Regression", Menu("tiny-llm Eval/Regression", "Checkpoint and regression tools.", [("Evaluate checkpoints", actions["tiny.eval.ckpt"]), ("Regression mock", actions["tiny.reg.mock"]), ("Regression HF", actions["tiny.reg.hf"])])),
-        ("tiny-llm PowerShell Workflows", Menu("tiny-llm PowerShell Workflows", "End-to-end scripted workflows.", [("run_lora_sft.ps1", actions["tiny.ps.sft"]), ("run_lora_sft_quality.ps1", actions["tiny.ps.sftq"]), ("run_lora_repair.ps1", actions["tiny.ps.repair"]), ("run_lora_targeted_repair.ps1", actions["tiny.ps.targeted"]), ("run_3b_programming_review.ps1", actions["tiny.ps.3b"]), ("run_3b_code_assistant_max.ps1", actions["tiny.ps.3bmax"]), ("release_lmstudio.ps1", actions["tiny.ps.release"])])),
         ("RAG Router", Menu("RAG Router", "RAG + memory router workflows.", [("Run local", actions["rag.local"]), ("Run auto local/cloud", actions["rag.auto"])])),
-        ("Utilities", Menu("Utilities", "Custom runners for any repo option.", [("Run custom Python command", actions["util.custom.py"]), ("Run custom shell command", actions["util.custom.sh"])])),
+        ("Utilities", Menu("Utilities", "Custom runners for any repo option.", [("Cross-platform notes", actions["util.cross_platform_notes"]), ("Run custom Python command", actions["util.custom.py"]), ("Run custom shell command", actions["util.custom.sh"])])),
     ]
+    if on_windows() or has_powershell_runtime():
+        items.insert(
+            8,
+            (
+                "tiny-llm PowerShell Workflows",
+                Menu(
+                    "tiny-llm PowerShell Workflows",
+                    "End-to-end scripted workflows.",
+                    [
+                        ("run_lora_sft.ps1", actions["tiny.ps.sft"]),
+                        ("run_lora_sft_quality.ps1", actions["tiny.ps.sftq"]),
+                        ("run_lora_repair.ps1", actions["tiny.ps.repair"]),
+                        ("run_lora_targeted_repair.ps1", actions["tiny.ps.targeted"]),
+                        ("run_3b_programming_review.ps1", actions["tiny.ps.3b"]),
+                        ("run_3b_code_assistant_max.ps1", actions["tiny.ps.3bmax"]),
+                        ("release_lmstudio.ps1", actions["tiny.ps.release"]),
+                    ],
+                ),
+            ),
+        )
+    root_menu.items = items
     exp_menu = maybe_experiment_menu(root, actions)
     if exp_menu is not None:
-        root_menu.items.insert(10, ("Experiments", exp_menu))
+        root_menu.items.insert(len(root_menu.items) - 1, ("Experiments", exp_menu))
     return root_menu
 
 
