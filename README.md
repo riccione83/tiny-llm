@@ -25,6 +25,25 @@ The repository is organized for repeatability and public readability: quick onbo
 
 ## Quick Start (Recommended Path)
 
+### 0) Quickstart launcher (all-in-one menu)
+
+```powershell
+python .\quickstart.py
+```
+
+Useful non-interactive variants:
+
+```powershell
+# List all action IDs:
+python .\quickstart.py --list-actions
+
+# Run one action by ID and auto-confirm:
+python .\quickstart.py --run env.install --yes
+
+# Disable banner animation (or set QUICKSTART_NO_ANIM=1):
+python .\quickstart.py --no-anim
+```
+
 ### 1) Install dependencies
 
 ```powershell
