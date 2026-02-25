@@ -1,9 +1,9 @@
 param(
-  [string]$BaseModelDir = "models/base_trained",
-  [string]$AdapterDir = "models/lora_repair_v2",
+  [string]$BaseModelDir = "models/lora_base_7b",
+  [string]$AdapterDir = "models/lora7b_seed_v1",
   [string]$Checkpoint = "",
   [string]$EvalReport = "",
-  [string]$ReleaseName = "tyny-lm-release2",
+  [string]$ReleaseName = "tiny-llm-7b-release1",
   [ValidateSet("Q8_0", "Q4_K_M", "F16")]
   [string]$QuantType = "Q8_0",
   [string]$LmStudioModelsRoot = "",

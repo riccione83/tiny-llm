@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """
-Modern base training pipeline (continued pretraining / domain adaptation).
+Modern base training pipeline.
+
+Supports two initialization modes:
+- pretrained: continued pretraining / domain adaptation from existing weights
+- scratch: random-weight initialization from a model config + tokenizer
 
 Design goals:
 - Stream large datasets from Hugging Face without full local download.
@@ -25,6 +29,7 @@ import torch
 from datasets import load_dataset
 from torch.utils.data import IterableDataset
 from transformers import (
+    AutoConfig,
     AutoModelForCausalLM,
     AutoTokenizer,
     Trainer,
@@ -109,6 +114,42 @@ def load_causal_lm(
             torch_dtype=dtype,
             **kwargs,
         )
+
+
+def load_scratch_causal_lm(
+    config_id_or_path: str,
+    tokenizer: AutoTokenizer,
+    dtype: torch.dtype,
+    trust_remote_code: bool,
+    attn_implementation: str,
+):
+    config = AutoConfig.from_pretrained(
+        config_id_or_path,
+        trust_remote_code=bool(trust_remote_code),
+    )
+    attn_impl = resolve_attn_implementation(attn_implementation)
+    if attn_impl:
+        # Different model families read one or both of these fields.
+        try:
+            config.attn_implementation = attn_impl
+        except Exception:
+            pass
+        try:
+            config._attn_implementation = attn_impl
+        except Exception:
+            pass
+    tok_len = int(len(tokenizer))
+    cfg_vocab = int(getattr(config, "vocab_size", 0) or 0)
+    if tok_len > 0 and cfg_vocab != tok_len:
+        print(f"Scratch init: aligning config vocab_size {cfg_vocab} -> {tok_len}")
+        config.vocab_size = tok_len
+    model = AutoModelForCausalLM.from_config(
+        config,
+        trust_remote_code=bool(trust_remote_code),
+    )
+    if torch.cuda.is_available() and dtype in {torch.float16, torch.bfloat16}:
+        model = model.to(dtype=dtype)
+    return model
 
 
 def resolve_attn_implementation(spec: str) -> Optional[str]:
@@ -756,6 +797,22 @@ def save_interrupt_checkpoint(trainer: Trainer, tokenizer: AutoTokenizer, out_di
 def main() -> None:
     ap = argparse.ArgumentParser(description="Train base model with streaming knowledge corpora")
     ap.add_argument("--model_dir", default="models/base")
+    ap.add_argument(
+        "--init_mode",
+        default="pretrained",
+        choices=["pretrained", "scratch"],
+        help="pretrained=load weights from --model_dir; scratch=initialize random weights from --config_source (or --model_dir).",
+    )
+    ap.add_argument(
+        "--tokenizer_source",
+        default="",
+        help="Tokenizer source path/repo id. Default: scratch->--config_source (or --model_dir), pretrained->--model_dir.",
+    )
+    ap.add_argument(
+        "--config_source",
+        default="",
+        help="Config source path/repo id for --init_mode scratch. Default: --model_dir.",
+    )
     ap.add_argument("--output_dir", default="models/base_trained")
     ap.add_argument("--recipe", default="standard", choices=["tiny", "standard", "knowledge-heavy"])
     ap.add_argument("--hf_source", action="append", default=[], help="Extra source: name|config|split|text_field|max_texts")
@@ -891,8 +948,26 @@ def main() -> None:
     out.mkdir(parents=True, exist_ok=True)
     configure_torch_runtime(bool(args.tf32))
 
+    init_mode = str(args.init_mode).strip().lower()
+    model_dir_source = str(args.model_dir).strip()
+    config_source = str(args.config_source).strip()
+    if init_mode == "scratch":
+        config_source = config_source or model_dir_source
+        if not config_source:
+            raise SystemExit("Scratch mode requires --config_source or --model_dir.")
+
+    tokenizer_source = str(args.tokenizer_source).strip()
+    if not tokenizer_source:
+        if init_mode == "scratch":
+            tokenizer_source = config_source or model_dir_source
+        else:
+            tokenizer_source = model_dir_source
+    if not tokenizer_source:
+        raise SystemExit(
+            "Tokenizer source is empty. Provide --tokenizer_source or set --config_source/--model_dir."
+        )
     tokenizer = AutoTokenizer.from_pretrained(
-        args.model_dir,
+        tokenizer_source,
         use_fast=True,
         trust_remote_code=bool(args.trust_remote_code),
     )
@@ -900,12 +975,25 @@ def main() -> None:
         tokenizer.pad_token = tokenizer.eos_token
 
     dtype = resolve_dtype(args.dtype)
-    model = load_causal_lm(
-        model_id_or_path=args.model_dir,
-        dtype=dtype,
-        trust_remote_code=bool(args.trust_remote_code),
-        attn_implementation=str(args.attn_implementation),
-    )
+    if init_mode == "scratch":
+        print(f"Model init mode: scratch (config={config_source}, tokenizer={tokenizer_source})")
+        model = load_scratch_causal_lm(
+            config_id_or_path=config_source,
+            tokenizer=tokenizer,
+            dtype=dtype,
+            trust_remote_code=bool(args.trust_remote_code),
+            attn_implementation=str(args.attn_implementation),
+        )
+    else:
+        if not model_dir_source:
+            raise SystemExit("Pretrained mode requires --model_dir.")
+        print(f"Model init mode: pretrained (model={model_dir_source})")
+        model = load_causal_lm(
+            model_id_or_path=model_dir_source,
+            dtype=dtype,
+            trust_remote_code=bool(args.trust_remote_code),
+            attn_implementation=str(args.attn_implementation),
+        )
     model.config.use_cache = False
 
     if tokenizer.vocab_size > model.get_input_embeddings().weight.shape[0]:
@@ -1135,7 +1223,10 @@ def main() -> None:
     tokenizer.save_pretrained(str(out))
 
     run_meta = {
-        "model_dir": str(Path(args.model_dir).resolve()),
+        "model_dir": str(model_dir_source),
+        "init_mode": init_mode,
+        "tokenizer_source": tokenizer_source,
+        "config_source": config_source,
         "output_dir": str(out.resolve()),
         "recipe": args.recipe,
         "sources": [name for name, _ in sources],

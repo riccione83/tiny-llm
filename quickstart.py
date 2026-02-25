@@ -38,6 +38,11 @@ ASCII_ART = r"""
                   |___/
 """
 
+DEFAULT_RUNTIME_HF_MODEL = "Qwen/Qwen2.5-0.5B-Instruct"
+DEFAULT_EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
+DEFAULT_API_MODEL_ID = "base-qwen-0.5b"
+DEFAULT_WIKI_EN_HF_SOURCE = "wikimedia/wikipedia|20231101.en|train|text|200000"
+
 
 def on_windows() -> bool:
     return os.name == "nt"
@@ -334,9 +339,9 @@ def plan_mini_chat(root: Path) -> Plan:
                 "--backend",
                 "hf",
                 "--model_name",
-                "Qwen/Qwen3-4B-Instruct-2507",
+                DEFAULT_RUNTIME_HF_MODEL,
                 "--embedding_model",
-                "sentence-transformers/all-MiniLM-L6-v2",
+                DEFAULT_EMBEDDING_MODEL,
                 "--temperature",
                 "0.0",
             )
@@ -355,6 +360,10 @@ def plan_mini_chat_debug(root: Path) -> Plan:
                 "mini_assistant.chat",
                 "--backend",
                 "hf",
+                "--model_name",
+                DEFAULT_RUNTIME_HF_MODEL,
+                "--embedding_model",
+                DEFAULT_EMBEDDING_MODEL,
                 "--show_debug",
                 "--direct_confidence_threshold",
                 "0.72",
@@ -370,7 +379,21 @@ def plan_mini_chat_url(root: Path) -> Optional[Plan]:
     return Plan(
         title="mini_assistant chat (fixed URL)",
         description="Run chat pinned to one source URL.",
-        commands=[p_cmd(root, "-m", "mini_assistant.chat", "--backend", "hf", "--url", url)],
+        commands=[
+            p_cmd(
+                root,
+                "-m",
+                "mini_assistant.chat",
+                "--backend",
+                "hf",
+                "--model_name",
+                DEFAULT_RUNTIME_HF_MODEL,
+                "--embedding_model",
+                DEFAULT_EMBEDDING_MODEL,
+                "--url",
+                url,
+            )
+        ],
     )
 
 
@@ -378,7 +401,7 @@ def plan_mini_direct_chat(root: Path) -> Plan:
     return Plan(
         title="mini_assistant direct chat",
         description="Direct chat without web retrieval.",
-        commands=[p_cmd(root, "-m", "mini_assistant.direct_chat", "--backend", "hf")],
+        commands=[p_cmd(root, "-m", "mini_assistant.direct_chat", "--backend", "hf", "--model_name", DEFAULT_RUNTIME_HF_MODEL)],
     )
 
 
@@ -386,14 +409,14 @@ def plan_api_server_default(root: Path) -> Plan:
     return Plan(
         title="model_api_server default",
         description="Start OpenAI-compatible local API server.",
-        commands=[p_cmd(root, "model_api_server.py", "--host", "127.0.0.1", "--port", "8001", "--default_model", "tiny-llm-7b")],
+        commands=[p_cmd(root, "model_api_server.py", "--host", "127.0.0.1", "--port", "8001", "--default_model", DEFAULT_API_MODEL_ID)],
     )
 
 
 def plan_api_server_custom(root: Path) -> Plan:
     host = prompt_str("Host", "127.0.0.1")
     port = prompt_int("Port", 8001)
-    default_model = prompt_str("Default model", "tiny-llm-7b")
+    default_model = prompt_str("Default model", DEFAULT_API_MODEL_ID)
     args = ["model_api_server.py", "--host", host, "--port", str(port), "--default_model", default_model]
     if not prompt_bool("Preload default model?", default=True):
         args.append("--no_preload_default")
@@ -422,20 +445,41 @@ def plan_eval_grounded(root: Path) -> Plan:
                 "--backend",
                 "hf",
                 "--model_name",
-                "Qwen/Qwen3-4B-Instruct-2507",
+                DEFAULT_RUNTIME_HF_MODEL,
                 "--embedding_model",
-                "sentence-transformers/all-MiniLM-L6-v2",
+                DEFAULT_EMBEDDING_MODEL,
             )
         ],
     )
 
 
 def plan_eval_chat(root: Path) -> Plan:
-    return Plan(title="Eval chat", description="Run eval.py chat suite.", commands=[p_cmd(root, "eval.py", "--suite", "chat", "--backend", "hf")])
+    return Plan(
+        title="Eval chat",
+        description="Run eval.py chat suite.",
+        commands=[p_cmd(root, "eval.py", "--suite", "chat", "--backend", "hf", "--model_name", DEFAULT_RUNTIME_HF_MODEL)],
+    )
 
 
 def plan_eval_both(root: Path) -> Plan:
-    return Plan(title="Eval both", description="Run both suites.", commands=[p_cmd(root, "eval.py", "--suite", "both", "--backend", "hf")])
+    return Plan(
+        title="Eval both",
+        description="Run both suites.",
+        commands=[
+            p_cmd(
+                root,
+                "eval.py",
+                "--suite",
+                "both",
+                "--backend",
+                "hf",
+                "--model_name",
+                DEFAULT_RUNTIME_HF_MODEL,
+                "--embedding_model",
+                DEFAULT_EMBEDDING_MODEL,
+            )
+        ],
+    )
 
 
 def plan_eval_conf_gate(root: Path) -> Plan:
@@ -450,9 +494,9 @@ def plan_eval_conf_gate(root: Path) -> Plan:
                 "--backend",
                 "hf",
                 "--model_name",
-                "Qwen/Qwen3-4B-Instruct-2507",
+                DEFAULT_RUNTIME_HF_MODEL,
                 "--embedding_model",
-                "sentence-transformers/all-MiniLM-L6-v2",
+                DEFAULT_EMBEDDING_MODEL,
                 "--direct_confidence_threshold",
                 "0.72",
             )
@@ -609,8 +653,183 @@ def plan_train_base_3b(root: Path) -> Plan:
     )
 
 
+def plan_train_base_scratch_05b(root: Path) -> Plan:
+    return Plan(
+        title="Train base 0.5B from scratch",
+        description="Random-weight initialization from Qwen 0.5B config/tokenizer.",
+        commands=[
+            p_cmd(
+                root / "tiny-llm",
+                "02_train_base.py",
+                "--init_mode",
+                "scratch",
+                "--model_dir",
+                "Qwen/Qwen2.5-0.5B-Instruct",
+                "--config_source",
+                "Qwen/Qwen2.5-0.5B-Instruct",
+                "--tokenizer_source",
+                "Qwen/Qwen2.5-0.5B-Instruct",
+                "--output_dir",
+                "models/base_05b_scratch_v1",
+                "--recipe",
+                "tiny",
+                "--max_steps",
+                "3000",
+                "--per_device_batch_size",
+                "1",
+                "--grad_accum",
+                "8",
+                "--block_size",
+                "1024",
+                "--gradient_checkpointing",
+            )
+        ],
+        warnings=["From-scratch base training is compute-intensive and much slower to converge than continued pretraining."],
+    )
+
+
+def plan_train_base_scratch_3b(root: Path) -> Plan:
+    return Plan(
+        title="Train base 3B from scratch",
+        description="Random-weight initialization from Qwen 3B config/tokenizer.",
+        commands=[
+            p_cmd(
+                root / "tiny-llm",
+                "02_train_base.py",
+                "--init_mode",
+                "scratch",
+                "--config_source",
+                "Qwen/Qwen2.5-3B-Instruct",
+                "--tokenizer_source",
+                "Qwen/Qwen2.5-3B-Instruct",
+                "--model_dir",
+                "Qwen/Qwen2.5-3B-Instruct",
+                "--output_dir",
+                "models/base_3b_scratch_v1",
+                "--recipe",
+                "tiny",
+                "--max_steps",
+                "3000",
+                "--per_device_batch_size",
+                "1",
+                "--grad_accum",
+                "16",
+                "--block_size",
+                "768",
+                "--auto_tune_shape",
+                "--auto_tune_batch_candidates",
+                "1,2",
+                "--auto_tune_block_candidates",
+                "512,768,1024",
+                "--gradient_checkpointing",
+            )
+        ],
+        warnings=["From-scratch base training is compute-intensive and much slower to converge than continued pretraining."],
+    )
+
+
+def plan_train_base_scratch_3b_wiki(root: Path) -> Plan:
+    return Plan(
+        title="Train base 3B from scratch + Wikipedia",
+        description="Random-weight initialization with tiny recipe plus streamed English Wikipedia.",
+        commands=[
+            p_cmd(
+                root / "tiny-llm",
+                "02_train_base.py",
+                "--init_mode",
+                "scratch",
+                "--config_source",
+                "Qwen/Qwen2.5-3B-Instruct",
+                "--tokenizer_source",
+                "Qwen/Qwen2.5-3B-Instruct",
+                "--model_dir",
+                "Qwen/Qwen2.5-3B-Instruct",
+                "--output_dir",
+                "models/base_3b_scratch_wiki_v1",
+                "--recipe",
+                "tiny",
+                "--hf_source",
+                DEFAULT_WIKI_EN_HF_SOURCE,
+                "--repeat_sources",
+                "--max_steps",
+                "3000",
+                "--per_device_batch_size",
+                "1",
+                "--grad_accum",
+                "16",
+                "--block_size",
+                "768",
+                "--auto_tune_shape",
+                "--auto_tune_batch_candidates",
+                "1,2",
+                "--auto_tune_block_candidates",
+                "512,768,1024",
+                "--gradient_checkpointing",
+            )
+        ],
+        warnings=[
+            "From-scratch base training is compute-intensive and much slower to converge than continued pretraining.",
+            "Wikipedia content is CC BY-SA; verify attribution/share-alike obligations for your release workflow.",
+        ],
+    )
+
+
+def plan_train_base_scratch_7b(root: Path) -> Plan:
+    return Plan(
+        title="Train base 7B from scratch",
+        description="Random-weight initialization from Qwen 7B config/tokenizer.",
+        commands=[
+            p_cmd(
+                root / "tiny-llm",
+                "02_train_base.py",
+                "--init_mode",
+                "scratch",
+                "--config_source",
+                "Qwen/Qwen2.5-7B-Instruct",
+                "--tokenizer_source",
+                "Qwen/Qwen2.5-7B-Instruct",
+                "--model_dir",
+                "Qwen/Qwen2.5-7B-Instruct",
+                "--output_dir",
+                "models/base_7b_scratch_v1",
+                "--recipe",
+                "tiny",
+                "--max_steps",
+                "2000",
+                "--per_device_batch_size",
+                "1",
+                "--grad_accum",
+                "32",
+                "--block_size",
+                "512",
+                "--auto_tune_shape",
+                "--auto_tune_batch_candidates",
+                "1",
+                "--auto_tune_block_candidates",
+                "384,512,768",
+                "--gradient_checkpointing",
+            )
+        ],
+        warnings=[
+            "From-scratch 7B is very compute-intensive and may require long multi-day runs on high-end GPUs.",
+            "If you hit OOM, reduce --block_size and/or use lower --auto_tune_target_vram_frac.",
+        ],
+    )
+
+
 def plan_train_base_custom(root: Path) -> Plan:
-    model_dir = prompt_str("Model dir", "models/base")
+    init_mode = prompt_str("Init mode [pretrained|scratch]", "pretrained").strip().lower()
+    if init_mode not in {"pretrained", "scratch"}:
+        print("Unknown init mode; using pretrained.")
+        init_mode = "pretrained"
+    if init_mode == "scratch":
+        config_source = prompt_str("Config source", "Qwen/Qwen2.5-0.5B-Instruct")
+        tokenizer_source = prompt_str("Tokenizer source", config_source)
+        model_dir = prompt_str("Model dir (config fallback)", config_source)
+    else:
+        config_source = ""
+        tokenizer_source = ""
+        model_dir = prompt_str("Model dir", "models/base")
     out_dir = prompt_str("Output dir", "models/base_custom")
     recipe = prompt_str("Recipe [tiny|standard|knowledge-heavy]", "standard")
     steps = prompt_int("Max steps", 3000)
@@ -624,6 +843,8 @@ def plan_train_base_custom(root: Path) -> Plan:
         model_dir,
         "--output_dir",
         out_dir,
+        "--init_mode",
+        init_mode,
         "--recipe",
         recipe,
         "--max_steps",
@@ -637,11 +858,24 @@ def plan_train_base_custom(root: Path) -> Plan:
         "--block_size",
         str(block),
     ]
+    if init_mode == "scratch":
+        if config_source.strip():
+            args.extend(["--config_source", config_source.strip()])
+        if tokenizer_source.strip():
+            args.extend(["--tokenizer_source", tokenizer_source.strip()])
     if prompt_bool("Repeat sources?", True):
         args.append("--repeat_sources")
     if prompt_bool("Gradient checkpointing?", True):
         args.append("--gradient_checkpointing")
-    return Plan(title="Train base custom", description="Interactive custom base training.", commands=[p_cmd(root / "tiny-llm", *args)])
+    warnings: List[str] = []
+    if init_mode == "scratch":
+        warnings.append("Scratch mode starts from random weights and typically needs much longer training.")
+    return Plan(
+        title="Train base custom",
+        description=f"Interactive custom base training ({init_mode}).",
+        commands=[p_cmd(root / "tiny-llm", *args)],
+        warnings=warnings,
+    )
 
 
 def plan_train_lora_7b(root: Path) -> Plan:
@@ -951,6 +1185,11 @@ def build_actions(root: Path) -> Dict[str, Action]:
     reg("tiny.download.7b", "Download LoRA base 7B", "03_download_lora_base.py", plan_download_7b_lora)
     reg("tiny.train.base.05b", "Train base 0.5B", "knowledge-heavy preset", plan_train_base_05b)
     reg("tiny.train.base.3b", "Train base 3B", "CPT preset", plan_train_base_3b)
+    reg("tiny.train.base.scratch", "Train base 0.5B from scratch", "random init preset", plan_train_base_scratch_05b)
+    reg("tiny.train.base.05b.scratch", "Train base 0.5B from scratch", "random init preset (explicit id)", plan_train_base_scratch_05b)
+    reg("tiny.train.base.3b.scratch", "Train base 3B from scratch", "random init preset", plan_train_base_scratch_3b)
+    reg("tiny.train.base.3b.scratch.wiki", "Train base 3B from scratch + Wikipedia", "random init + wiki stream", plan_train_base_scratch_3b_wiki)
+    reg("tiny.train.base.7b.scratch", "Train base 7B from scratch", "random init preset", plan_train_base_scratch_7b)
     reg("tiny.train.base.custom", "Train base custom", "custom base params", plan_train_base_custom)
     reg("tiny.train.lora.3b", "Train LoRA 3B", "3B seed preset", plan_train_lora_3b)
     reg("tiny.train.lora.7b", "Train LoRA 7B", "official 7B preset", plan_train_lora_7b)
@@ -1014,7 +1253,22 @@ def build_menu(root: Path, actions: Dict[str, Action]) -> Menu:
         ("Model API Server", Menu("Model API Server", "OpenAI-compatible local API.", [("Start server default", actions["api.server.default"]), ("Start server custom", actions["api.server.custom"]), ("Run API smoke test", actions["api.smoke"])])),
         ("Evaluation", Menu("Evaluation", "Regression and quality checks.", [("Grounded eval", actions["eval.grounded"]), ("Chat eval", actions["eval.chat"]), ("Both eval suites", actions["eval.both"]), ("Confidence gate eval", actions["eval.conf"]), ("Unit tests", actions["eval.tests"]), ("scripts/check.ps1", actions["eval.check"])])),
         ("tiny-llm Download", Menu("tiny-llm Download", "Download model artifacts.", [("Download base 0.5B", actions["tiny.download.05b"]), ("Download base 3B", actions["tiny.download.3b"]), ("Download LoRA base 7B", actions["tiny.download.7b"])])),
-        ("tiny-llm Train Base", Menu("tiny-llm Train Base", "Base model training.", [("Train 0.5B preset", actions["tiny.train.base.05b"]), ("Train 3B preset", actions["tiny.train.base.3b"]), ("Train with your parameters", actions["tiny.train.base.custom"])])),
+        (
+            "tiny-llm Train Base",
+            Menu(
+                "tiny-llm Train Base",
+                "Base model training.",
+                [
+                    ("Train 0.5B preset", actions["tiny.train.base.05b"]),
+                    ("Train 3B preset", actions["tiny.train.base.3b"]),
+                    ("Train 0.5B from scratch", actions["tiny.train.base.scratch"]),
+                    ("Train 3B from scratch", actions["tiny.train.base.3b.scratch"]),
+                    ("Train 3B from scratch + Wikipedia", actions["tiny.train.base.3b.scratch.wiki"]),
+                    ("Train 7B from scratch", actions["tiny.train.base.7b.scratch"]),
+                    ("Train with your parameters", actions["tiny.train.base.custom"]),
+                ],
+            ),
+        ),
         ("tiny-llm Train LoRA", Menu("tiny-llm Train LoRA", "LoRA/QLoRA workflows.", [("Train 3B preset", actions["tiny.train.lora.3b"]), ("Train 7B preset", actions["tiny.train.lora.7b"]), ("Train with your parameters", actions["tiny.train.lora.custom"])])),
         ("tiny-llm Eval/Regression", Menu("tiny-llm Eval/Regression", "Checkpoint and regression tools.", [("Evaluate checkpoints", actions["tiny.eval.ckpt"]), ("Regression mock", actions["tiny.reg.mock"]), ("Regression HF", actions["tiny.reg.hf"])])),
         ("RAG Router", Menu("RAG Router", "RAG + memory router workflows.", [("Run local", actions["rag.local"]), ("Run auto local/cloud", actions["rag.auto"])])),

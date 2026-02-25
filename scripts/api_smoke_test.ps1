@@ -1,6 +1,6 @@
 param(
     [string]$BaseUrl = "http://127.0.0.1:8001",
-    [string[]]$Models = @("tiny-llm-7b")
+    [string[]]$Models = @("tiny-llm-7b", "base-qwen-0.5b")
 )
 
 $ErrorActionPreference = "Stop"

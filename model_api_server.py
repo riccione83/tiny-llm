@@ -196,7 +196,10 @@ def _recommended_max_3b_adapter() -> Optional[Path]:
 
 def default_registry() -> Dict[str, ModelSpec]:
     reg: Dict[str, ModelSpec] = {}
-    release_7b_merged = ROOT / "tiny-llm" / "models" / "releases" / "tyny-lm-7b-release1" / "merged_model"
+    release_7b_merged = ROOT / "tiny-llm" / "models" / "releases" / "tiny-llm-7b-release1" / "merged_model"
+    if not release_7b_merged.exists():
+        # Backward-compatible autodiscovery for legacy release naming.
+        release_7b_merged = ROOT / "tiny-llm" / "models" / "releases" / "tyny-lm-7b-release1" / "merged_model"
     # Base models (HF ids or local dirs).
     reg["base-qwen-0.5b"] = ModelSpec(
         model_id="base-qwen-0.5b",
