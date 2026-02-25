@@ -18,6 +18,29 @@ If you want base training (continued pretraining or scratch initialization), use
 - Internet access for first model download and web retrieval
 - Optional GPU for speed (CUDA strongly recommended for training)
 
+### Hugging Face Token (Recommended)
+
+Using `HF_TOKEN` is recommended for higher download rate limits and more stable dataset/model pulls.
+
+Windows (PowerShell):
+
+```powershell
+[Environment]::SetEnvironmentVariable("HF_TOKEN", "<your_hf_token>", "User")
+$env:HF_TOKEN = [Environment]::GetEnvironmentVariable("HF_TOKEN", "User")
+```
+
+Linux/macOS (bash/zsh):
+
+```bash
+export HF_TOKEN="<your_hf_token>"
+```
+
+Quick check:
+
+```bash
+python -c "import os; print('HF_TOKEN OK' if os.getenv('HF_TOKEN') else 'HF_TOKEN MISSING')"
+```
+
 ## Platform Support Matrix
 
 | Platform Profile | Runtime Assistant | Evaluations | LoRA Training | QLoRA 4-bit | LM Studio Release Packaging |
@@ -74,6 +97,24 @@ Scratch-initialization quickstart action IDs:
 - `tiny.train.base.3b.scratch`
 - `tiny.train.base.3b.scratch.wiki`
 - `tiny.train.base.7b.scratch`
+
+### Scratch Training Milestones (Indicative)
+
+These checkpoints are high-level expectations for random-init runs and are intentionally conservative.
+
+| Stage | Typical Step Range | Expected Signals |
+|---|---|---|
+| Bootstrap | `0-2k` | High/unstable loss; repetitive or broken samples are normal |
+| Early stabilization | `2k-10k` | Loss starts to settle; samples remain weak but less chaotic |
+| First useful learning | `10k-50k` | Clearer syntax and fewer repeated fragments in sample logs |
+| Mid run | `50k+` | Gradual quality improvements; progress becomes incremental |
+
+### Known Issues (Scratch Base Training)
+
+- `OOM after shape probing`: auto-tune may pass probe but fail in full training due to optimizer-state memory. Reduce `--block_size`, lower batch, or disable auto-tune.
+- `loss spike + grad_norm nan`: this is numerical divergence. Stop the run and resume from the last healthy checkpoint (before NaN).
+- `Windows DataLoader worker crash`: if you see pickling errors, use `--dataloader_num_workers 0` (the trainer now auto-falls back when possible).
+- `Low GPU power despite high utilization`: this can be memory/data-pipeline bound and is normal for some scratch profiles.
 
 ## Repository Layout
 

@@ -99,6 +99,35 @@ Quickstart action IDs for scratch-initialization presets:
 - `tiny.train.base.3b.scratch.wiki`
 - `tiny.train.base.7b.scratch`
 
+## Scratch Run Milestones (Indicative)
+
+For random-init base training, early outputs are expected to look weak for a long window.
+
+| Stage | Typical Step Range | What You Usually See |
+|---|---|---|
+| Bootstrap | `0-2k` | High loss, repetitive tokens, unstable sample quality |
+| Early stabilization | `2k-10k` | Loss becomes less noisy, still far from useful generations |
+| First consistent gains | `10k-50k` | Fewer repetitions, better local coherence in short outputs |
+| Long-run refinement | `50k+` | Slower but steady improvements; quality gains become incremental |
+
+These ranges are hardware/corpus dependent and are not pass/fail thresholds.
+
+## Scratch Stability and Recovery
+
+- `OOM after auto-tune`: probe success does not guarantee full-step success when optimizer state is allocated. Reduce sequence length first (`--block_size`), then batch shape.
+- `NaN divergence`: if you see `grad_norm: nan` or extreme loss spikes, stop immediately and resume from the most recent healthy checkpoint.
+- `Checkpoint health`: a checkpoint can have valid `trainer_state.json` but corrupted model weights if NaN happened after save scheduling; prefer the latest checkpoint with stable recent logs.
+- `Windows worker errors`: if multiprocessing/pickling errors appear, run with `--dataloader_num_workers 0`.
+- `Allocator env var`: use `PYTORCH_ALLOC_CONF` (new name) instead of deprecated `PYTORCH_CUDA_ALLOC_CONF`.
+
+Resume pattern:
+
+```bash
+python ./02_train_base.py \
+  --resume_from_checkpoint models/<run_dir>/checkpoint-<step> \
+  --ignore_data_skip
+```
+
 ## 1) Install
 
 ```bash
