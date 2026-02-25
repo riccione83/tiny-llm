@@ -17,6 +17,7 @@ from __future__ import annotations
 import argparse
 import inspect
 import json
+import pickle
 import platform
 import random
 import re
@@ -175,9 +176,15 @@ def configure_torch_runtime(enable_tf32: bool) -> None:
             pass
 
 
-def resolve_optimizer_name(use_fused_optimizer: bool) -> str:
+def resolve_optimizer_name(use_fused_optimizer: bool, optimizer: str = "auto") -> str:
+    requested = (optimizer or "auto").strip().lower()
     base = "adamw_torch"
-    if not use_fused_optimizer or (not torch.cuda.is_available()):
+    if requested == "adafactor":
+        return "adafactor"
+    if requested == "adamw":
+        return base
+    want_fused = requested == "adamw_fused" or (requested == "auto" and bool(use_fused_optimizer))
+    if not want_fused or (not torch.cuda.is_available()):
         return base
     try:
         from transformers.training_args import OptimizerNames
@@ -247,7 +254,38 @@ def parse_str_csv(spec: str) -> List[str]:
     return sorted(set(vals))
 
 
-def probe_shape_fits(model, vocab_size: int, batch_size: int, seq_len: int) -> Tuple[bool, int]:
+def _build_probe_optimizer(model, optim_name: str, learning_rate: float):
+    name = (optim_name or "adamw_torch").strip().lower()
+    if name == "adafactor":
+        from transformers.optimization import Adafactor
+
+        return Adafactor(
+            model.parameters(),
+            lr=float(learning_rate),
+            relative_step=False,
+            scale_parameter=False,
+            warmup_init=False,
+        )
+    fused = name in {"adamw_torch_fused", "adamw_fused"}
+    if fused:
+        try:
+            sig = inspect.signature(torch.optim.AdamW.__init__).parameters
+            if "fused" in sig:
+                return torch.optim.AdamW(model.parameters(), lr=float(learning_rate), fused=True)
+        except Exception:
+            pass
+    return torch.optim.AdamW(model.parameters(), lr=float(learning_rate))
+
+
+def probe_shape_fits(
+    model,
+    vocab_size: int,
+    batch_size: int,
+    seq_len: int,
+    optim_name: str,
+    learning_rate: float,
+    include_optimizer_step: bool,
+) -> Tuple[bool, int]:
     if not torch.cuda.is_available():
         return True, 0
 
@@ -270,8 +308,13 @@ def probe_shape_fits(model, vocab_size: int, batch_size: int, seq_len: int) -> T
         out = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
         loss = out.loss
         loss.backward()
+        probe_optimizer = None
+        if bool(include_optimizer_step):
+            probe_optimizer = _build_probe_optimizer(model, optim_name=optim_name, learning_rate=float(learning_rate))
+            probe_optimizer.step()
+            probe_optimizer.zero_grad(set_to_none=True)
         peak = int(torch.cuda.max_memory_allocated(device))
-        del out, loss, input_ids, attention_mask, labels
+        del out, loss, input_ids, attention_mask, labels, probe_optimizer
         model.zero_grad(set_to_none=True)
         torch.cuda.empty_cache()
         return True, peak
@@ -293,6 +336,9 @@ def auto_tune_training_shape(
     block_candidates: List[int],
     target_vram_frac: float,
     max_trials: int,
+    optim_name: str,
+    learning_rate: float,
+    include_optimizer_step: bool,
 ) -> Tuple[int, int]:
     if not torch.cuda.is_available():
         return int(init_batch_size), int(init_block_size)
@@ -323,8 +369,22 @@ def auto_tune_training_shape(
         "Auto-tuning GPU shape: "
         f"{len(combos)} trial(s), target VRAM <= {max(0.5, min(0.99, float(target_vram_frac))):.2f}"
     )
+    print(
+        "Auto-tune probe: "
+        f"forward+backward{'+optimizer_step' if bool(include_optimizer_step) else ''} "
+        "(real training memory estimate)",
+        flush=True,
+    )
     for bs, seq in combos:
-        ok, peak = probe_shape_fits(model, vocab_size=vocab_size, batch_size=bs, seq_len=seq)
+        ok, peak = probe_shape_fits(
+            model,
+            vocab_size=vocab_size,
+            batch_size=bs,
+            seq_len=seq,
+            optim_name=str(optim_name),
+            learning_rate=float(learning_rate),
+            include_optimizer_step=bool(include_optimizer_step),
+        )
         if not ok:
             print(f"- bs={bs}, block={seq}: OOM")
             continue
@@ -769,6 +829,35 @@ class TextSampleLoggingCallback(TrainerCallback):
         return control
 
 
+class StartupStepLoggingCallback(TrainerCallback):
+    def __init__(self, total_steps: int, startup_log_steps: int) -> None:
+        self.total_steps = max(0, int(total_steps))
+        self.startup_log_steps = max(0, int(startup_log_steps))
+        self._last_logged_step = -1
+
+    def on_train_begin(self, args, state, control, **kwargs):
+        if hasattr(state, "is_local_process_zero") and not bool(state.is_local_process_zero):
+            return control
+        print(
+            f"Starting base training loop... (max_steps={self.total_steps}, early_step_logs={self.startup_log_steps})",
+            flush=True,
+        )
+        return control
+
+    def on_step_end(self, args, state, control, **kwargs):
+        if self.startup_log_steps <= 0:
+            return control
+        if hasattr(state, "is_local_process_zero") and not bool(state.is_local_process_zero):
+            return control
+        step = int(getattr(state, "global_step", 0))
+        if step <= 0 or step == self._last_logged_step or step > self.startup_log_steps:
+            return control
+        self._last_logged_step = step
+        pct = (100.0 * float(step) / float(self.total_steps)) if self.total_steps > 0 else 0.0
+        print(f"[Warmup] step {step}/{self.total_steps} ({pct:.2f}%)", flush=True)
+        return control
+
+
 def save_interrupt_checkpoint(trainer: Trainer, tokenizer: AutoTokenizer, out_dir: Path, reason: str) -> Path:
     step = int(getattr(trainer.state, "global_step", 0))
     if step > 0 and hasattr(trainer, "_save_checkpoint"):
@@ -833,7 +922,11 @@ def main() -> None:
         default=True,
         help="Try passing languages=[...] to load_dataset when --hf_code_languages is set; fallback automatically if unsupported.",
     )
-    ap.add_argument("--disable_hf_data", action="store_true", help="Use only local data globs")
+    ap.add_argument(
+        "--disable_hf_data",
+        action="store_true",
+        help="Disable recipe HF sources (manual --hf_source entries are still used).",
+    )
     ap.add_argument("--allow_remote_dataset_code", action="store_true")
     ap.add_argument(
         "--local_text_glob",
@@ -850,6 +943,14 @@ def main() -> None:
     ap.add_argument("--min_chars", type=int, default=80)
     ap.add_argument("--max_texts_per_source", type=int, default=0, help="0 = use recipe defaults")
     ap.add_argument("--repeat_sources", action="store_true")
+    ap.add_argument("--dataloader_num_workers", type=int, default=0, help="DataLoader workers. >0 can improve throughput at the cost of extra CPU/RAM.")
+    ap.add_argument("--dataloader_prefetch_factor", type=int, default=2, help="Prefetch factor per DataLoader worker (used only when workers > 0).")
+    ap.add_argument(
+        "--dataloader_persistent_workers",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Keep DataLoader workers alive between iterations (used only when workers > 0).",
+    )
 
     ap.add_argument("--block_size", type=int, default=1280)
     ap.add_argument("--auto_tune_shape", action="store_true", help="Auto-find the largest safe batch/block shape on GPU")
@@ -857,6 +958,12 @@ def main() -> None:
     ap.add_argument("--auto_tune_batch_candidates", default="2,3,4,5,6", help="CSV list of batch sizes to probe")
     ap.add_argument("--auto_tune_block_candidates", default="1024,1280,1536,1792,2048", help="CSV list of block sizes to probe")
     ap.add_argument("--auto_tune_max_trials", type=int, default=24, help="Max number of shape probes")
+    ap.add_argument(
+        "--auto_tune_include_optimizer_step",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Include an optimizer step during shape probes for more realistic memory estimation.",
+    )
     ap.add_argument("--max_steps", type=int, default=30_000)
     ap.add_argument("--per_device_batch_size", type=int, default=2)
     ap.add_argument("--grad_accum", type=int, default=8)
@@ -867,6 +974,7 @@ def main() -> None:
     ap.add_argument("--logging_steps", type=int, default=20)
     ap.add_argument("--save_steps", type=int, default=500)
     ap.add_argument("--save_total_limit", type=int, default=4)
+    ap.add_argument("--startup_log_steps", type=int, default=10, help="Print step progress for the first N optimizer steps (0 disables)")
     ap.add_argument("--sample_log_steps", type=int, default=200, help="Print preview samples every N optimizer steps (0 disables)")
     ap.add_argument("--sample_log_count", type=int, default=2, help="How many samples to print each preview event")
     ap.add_argument("--sample_log_max_chars", type=int, default=220, help="Max characters per printed sample")
@@ -892,6 +1000,12 @@ def main() -> None:
         action=argparse.BooleanOptionalAction,
         default=True,
         help="Use fused AdamW when supported by torch/transformers.",
+    )
+    ap.add_argument(
+        "--optimizer",
+        default="auto",
+        choices=["auto", "adamw", "adamw_fused", "adafactor"],
+        help="Optimizer selection. auto chooses fused AdamW on CUDA when supported.",
     )
     ap.add_argument(
         "--tf32",
@@ -1002,6 +1116,8 @@ def main() -> None:
     if args.gradient_checkpointing:
         model.gradient_checkpointing_enable()
 
+    optim_name = resolve_optimizer_name(bool(args.use_fused_optimizer), str(args.optimizer))
+
     if args.auto_tune_shape:
         tuned_bs, tuned_block = auto_tune_training_shape(
             model=model,
@@ -1012,6 +1128,9 @@ def main() -> None:
             block_candidates=parse_int_csv(args.auto_tune_block_candidates, fallback=[int(args.block_size)]),
             target_vram_frac=float(args.auto_tune_target_vram_frac),
             max_trials=int(args.auto_tune_max_trials),
+            optim_name=str(optim_name),
+            learning_rate=float(args.learning_rate),
+            include_optimizer_step=bool(args.auto_tune_include_optimizer_step),
         )
         args.per_device_batch_size = int(tuned_bs)
         args.block_size = int(tuned_block)
@@ -1049,17 +1168,17 @@ def main() -> None:
             )
             sources.append((f"hf:{resolved.name}", fn))
 
-        for spec in args.hf_source:
-            resolved = parse_hf_source(spec, fallback_max_texts=int(args.max_texts_per_source))
-            fn = make_hf_text_iter(
-                source=resolved,
-                allow_remote_dataset_code=bool(args.allow_remote_dataset_code),
-                min_chars=int(args.min_chars),
-                code_languages=hf_code_languages,
-                require_language_tag=bool(args.hf_require_language_tag),
-                try_dataset_languages_param=bool(args.hf_try_dataset_languages_param),
-            )
-            sources.append((f"hf:{resolved.name}", fn))
+    for spec in args.hf_source:
+        resolved = parse_hf_source(spec, fallback_max_texts=int(args.max_texts_per_source))
+        fn = make_hf_text_iter(
+            source=resolved,
+            allow_remote_dataset_code=bool(args.allow_remote_dataset_code),
+            min_chars=int(args.min_chars),
+            code_languages=hf_code_languages,
+            require_language_tag=bool(args.hf_require_language_tag),
+            try_dataset_languages_param=bool(args.hf_try_dataset_languages_param),
+        )
+        sources.append((f"hf:{resolved.name}", fn))
 
     if not args.disable_local_data:
         for g in args.local_text_glob:
@@ -1121,9 +1240,34 @@ def main() -> None:
                 use_fp16 = False
         except Exception:
             pass
-    optim_name = resolve_optimizer_name(bool(args.use_fused_optimizer))
     compile_mode = str(args.torch_compile_mode).strip() or "max-autotune"
     compile_backend = resolve_torch_compile_backend(str(args.torch_compile_backend))
+
+    approx_params = int(sum(p.numel() for p in model.parameters()))
+    effective_tokens = int(args.per_device_batch_size) * int(args.grad_accum) * int(args.block_size)
+    print("Starting base training setup...", flush=True)
+    print(
+        "Run config: "
+        f"init_mode={init_mode}, optimizer={optim_name}, dtype={str(dtype)}, "
+        f"batch={int(args.per_device_batch_size)}, grad_accum={int(args.grad_accum)}, block_size={int(args.block_size)}, "
+        f"effective_tokens_per_update={effective_tokens}, max_steps={int(args.max_steps)}",
+        flush=True,
+    )
+    print(
+        "Data pipeline: "
+        f"sources={len(sources)} stream(s), repeat_sources={'on' if bool(args.repeat_sources) else 'off'}, "
+        f"dataloader_workers={int(args.dataloader_num_workers)}",
+        flush=True,
+    )
+    if torch.cuda.is_available():
+        total_vram = float(torch.cuda.get_device_properties(0).total_memory) / float(1024**3)
+        print(f"CUDA detected: VRAM={total_vram:.1f} GB, params~{approx_params / 1e9:.2f}B", flush=True)
+        if approx_params >= 2_500_000_000 and total_vram <= 16.5 and optim_name.startswith("adamw"):
+            print(
+                "Warning: 3B+ full-parameter scratch on 16GB with AdamW often OOM. "
+                "Try --optimizer adafactor, lower --block_size, or use 0.5B scratch.",
+                flush=True,
+            )
 
     print(
         "Runtime config: "
@@ -1133,7 +1277,18 @@ def main() -> None:
         f"attn={resolve_attn_implementation(str(args.attn_implementation)) or 'default'}"
     )
 
-    targs = make_training_arguments(
+    workers = max(0, int(args.dataloader_num_workers))
+    if workers > 0:
+        try:
+            pickle.dumps(dataset)
+        except Exception as exc:
+            print(
+                "DataLoader workers>0 requested, but dataset pipeline is not picklable on this runtime "
+                f"({type(exc).__name__}: {exc}). Falling back to dataloader_num_workers=0.",
+                flush=True,
+            )
+            workers = 0
+    targs_kwargs = dict(
         output_dir=str(out),
         overwrite_output_dir=True,
         save_strategy="steps",
@@ -1145,13 +1300,14 @@ def main() -> None:
         warmup_ratio=float(args.warmup_ratio),
         lr_scheduler_type=str(args.lr_scheduler_type),
         logging_steps=int(args.logging_steps),
+        logging_first_step=True,
         save_steps=int(args.save_steps),
         save_total_limit=int(args.save_total_limit),
         bf16=bool(use_bf16),
         fp16=bool(use_fp16),
         report_to=[],
         remove_unused_columns=False,
-        dataloader_num_workers=0,
+        dataloader_num_workers=workers,
         dataloader_pin_memory=torch.cuda.is_available(),
         optim=optim_name,
         save_safetensors=True,
@@ -1159,16 +1315,26 @@ def main() -> None:
         ignore_data_skip=bool(args.ignore_data_skip),
         tf32=bool(args.tf32),
         torch_compile=bool(args.torch_compile),
-        torch_compile_mode=compile_mode,
-        torch_compile_backend=compile_backend,
     )
+    if workers > 0:
+        targs_kwargs["dataloader_prefetch_factor"] = max(1, int(args.dataloader_prefetch_factor))
+        targs_kwargs["dataloader_persistent_workers"] = bool(args.dataloader_persistent_workers)
+    if bool(args.torch_compile):
+        targs_kwargs["torch_compile_mode"] = compile_mode
+        targs_kwargs["torch_compile_backend"] = compile_backend
 
-    trainer = Trainer(
-        model=model,
-        args=targs,
-        train_dataset=dataset,
-        data_collator=default_data_collator,
-        callbacks=[
+    targs = make_training_arguments(**targs_kwargs)
+
+    callbacks: List[TrainerCallback] = []
+    if int(args.startup_log_steps) > 0:
+        callbacks.append(
+            StartupStepLoggingCallback(
+                total_steps=int(args.max_steps),
+                startup_log_steps=int(args.startup_log_steps),
+            )
+        )
+    if (sample_previews or eval_prompts) and (not args.disable_sample_logging) and int(args.sample_log_steps) > 0:
+        callbacks.append(
             TextSampleLoggingCallback(
                 previews=sample_previews,
                 tokenizer=tokenizer,
@@ -1181,9 +1347,14 @@ def main() -> None:
                 gen_top_p=float(args.sample_gen_top_p),
                 seed=int(args.seed),
             )
-        ]
-        if (sample_previews or eval_prompts) and (not args.disable_sample_logging) and int(args.sample_log_steps) > 0
-        else None,
+        )
+
+    trainer = Trainer(
+        model=model,
+        args=targs,
+        train_dataset=dataset,
+        data_collator=default_data_collator,
+        callbacks=callbacks if callbacks else None,
     )
     old_sigint = signal.getsignal(signal.SIGINT)
     old_sigterm = signal.getsignal(signal.SIGTERM) if hasattr(signal, "SIGTERM") else None
@@ -1233,6 +1404,8 @@ def main() -> None:
         "block_size": int(args.block_size),
         "max_steps": int(args.max_steps),
         "learning_rate": float(args.learning_rate),
+        "optimizer": str(optim_name),
+        "startup_log_steps": int(args.startup_log_steps),
         "dtype": str(dtype),
         "repeat_sources": bool(args.repeat_sources),
     }
